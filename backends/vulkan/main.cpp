@@ -1,35 +1,72 @@
 // Vulkan backend entry point.
 //
-// Phase 0 scaffolding only. This does not render anything and creates no
-// Vulkan objects -- it exists to prove the toolchain is wired up: the Vulkan
-// headers are found, the loader links, and GLFW initialises. Real Vulkan
-// setup (instance, device, queues) starts in Phase 1.
+// Phase 1, step 1 -- vulkan-tutorial.com "Base code":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Base_code
+//
+// Program skeleton and a GLFW window. No Vulkan objects exist yet;
+// initVulkan() is deliberately empty and gets filled in over the next steps.
 
+#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-#include <vulkan/vulkan.h>
 
+#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+
+const uint32_t WIDTH = 800;
+const uint32_t HEIGHT = 600;
+
+class vulkan_app {
+public:
+    void run() {
+        initWindow();
+        initVulkan();
+        mainLoop();
+        cleanup();
+    }
+
+private:
+    GLFWwindow* window;
+
+    void initWindow() {
+        glfwInit();
+
+        // GLFW was written for OpenGL and creates an OpenGL context by
+        // default. Vulkan has no context -- we manage every resource
+        // ourselves -- so that default has to be switched off.
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+
+        // Resizing invalidates the swap chain and needs recreation logic,
+        // which arrives in Phase 2. Disabled until then.
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+    }
+
+    void initVulkan() {
+    }
+
+    void mainLoop() {
+        while (!glfwWindowShouldClose(window)) {
+            glfwPollEvents();
+        }
+    }
+
+    void cleanup() {
+        glfwDestroyWindow(window);
+        glfwTerminate();
+    }
+};
 
 int main() {
-    if (!glfwInit()) {
-        std::cerr << "glfwInit failed\n";
-        return 1;
+    vulkan_app app;
+
+    try {
+        app.run();
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
     }
 
-    // The one Vulkan call in this file. Without it nothing would actually
-    // require symbols from libvulkan, and the link would prove nothing.
-    uint32_t api_version = 0;
-    if (vkEnumerateInstanceVersion(&api_version) != VK_SUCCESS) {
-        std::cerr << "vkEnumerateInstanceVersion failed\n";
-        glfwTerminate();
-        return 1;
-    }
-
-    std::cout << "Vulkan loader API version: "
-              << VK_API_VERSION_MAJOR(api_version) << '.'
-              << VK_API_VERSION_MINOR(api_version) << '.'
-              << VK_API_VERSION_PATCH(api_version) << '\n';
-
-    glfwTerminate();
-    return 0;
+    return EXIT_SUCCESS;
 }
