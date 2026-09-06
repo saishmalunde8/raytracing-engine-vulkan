@@ -1,11 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 1, step 5 -- vulkan-tutorial.com "Logical device and queues":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Logical_device_and_queues
+// Phase 2, step 1a -- vulkan-tutorial.com "Window surface":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Window_surface
 //
-// Opens a logical device on the chosen GPU and retrieves a handle to the
-// queue work will be submitted through. Completes Phase 1: a real,
-// configured connection to the GPU now exists.
+// Creates the VkSurfaceKHR bridging Vulkan and the macOS window. Core Vulkan
+// knows nothing about windows -- it is specified to run headless -- so
+// presentation lives entirely in extensions, and the surface is the
+// platform-neutral handle to whatever we will eventually present to.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -97,6 +98,11 @@ private:
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;
 
+    // Created from the instance, not the device: the window exists before any
+    // GPU has been chosen, and from the next step onward whether a GPU is
+    // suitable depends on its ability to present to this surface.
+    VkSurfaceKHR surface;
+
     // Not created and not destroyed -- this is a handle to hardware that
     // already exists. It is released implicitly with the instance, which is
     // why it never appears in cleanup().
@@ -127,6 +133,7 @@ private:
     void initVulkan() {
         createInstance();
         setupDebugMessenger();
+        createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
     }
@@ -268,6 +275,21 @@ private:
                 instance, &createInfo, nullptr, &debugMessenger) != VK_SUCCESS) {
             throw std::runtime_error("failed to set up debug messenger!");
         }
+    }
+
+    // GLFW hides the platform-specific call behind one function. On macOS it
+    // takes the CAMetalLayer from the NSWindow's content view and calls
+    // vkCreateMetalSurfaceEXT; on Windows the same line becomes
+    // vkCreateWin32SurfaceKHR. The extensions this needs -- VK_KHR_surface and
+    // VK_EXT_metal_surface -- are already enabled: they are exactly what
+    // glfwGetRequiredInstanceExtensions() has been returning since step 2.
+    void createSurface() {
+        if (glfwCreateWindowSurface(instance, window, nullptr, &surface) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create window surface!");
+        }
+
+        std::cout << "Window surface created" << std::endl;
     }
 
     void pickPhysicalDevice() {
@@ -432,6 +454,11 @@ private:
         if (enableValidationLayers) {
             DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         }
+
+        // Before the instance it was created from. Omitting this does not
+        // crash: validation simply reports a leaked VkSurfaceKHR at
+        // vkDestroyInstance, which is the whole point of having the layers on.
+        vkDestroySurfaceKHR(instance, surface, nullptr);
 
         vkDestroyInstance(instance, nullptr);
 
