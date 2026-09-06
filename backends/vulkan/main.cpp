@@ -1,11 +1,11 @@
 // Vulkan backend entry point.
 //
-// Phase 1, step 4 -- vulkan-tutorial.com "Physical devices and queue
-// families":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Physical_devices_and_queue_families
+// Phase 1, step 5 -- vulkan-tutorial.com "Logical device and queues":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Logical_device_and_queues
 //
-// Enumerates the GPUs the instance can see and picks one that exposes a
-// queue family supporting both graphics and compute work.
+// Opens a logical device on the chosen GPU and retrieves a handle to the
+// queue work will be submitted through. Completes Phase 1: a real,
+// configured connection to the GPU now exists.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -22,6 +22,17 @@ const uint32_t HEIGHT = 600;
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
+};
+
+// Device-level extensions, distinct from the instance-level ones.
+//
+// VK_KHR_portability_subset is the second half of the macOS fix. The instance
+// extension in step 2 said "show me incomplete drivers"; this one says "I
+// acknowledge this specific device is incomplete". The spec requires enabling
+// it on any device that advertises it, and the tutorial does not emphasise
+// that -- omitting it trips validation errors later rather than here.
+const std::vector<const char*> deviceExtensions = {
+    "VK_KHR_portability_subset"
 };
 
 #ifdef NDEBUG
@@ -91,6 +102,13 @@ private:
     // why it never appears in cleanup().
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 
+    // Created, owned and destroyed by us, unlike the physical device above.
+    VkDevice device;
+
+    // Queues are created with the device and die with it, so there is no
+    // destroy call for this -- it is only a handle to one that already exists.
+    VkQueue graphicsAndComputeQueue;
+
     void initWindow() {
         glfwInit();
 
@@ -110,6 +128,7 @@ private:
         createInstance();
         setupDebugMessenger();
         pickPhysicalDevice();
+        createLogicalDevice();
     }
 
     void createInstance() {
@@ -209,6 +228,13 @@ private:
 
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 
+        // Required dependency of the VK_KHR_portability_subset device
+        // extension enabled in createLogicalDevice(). Without it
+        // vkCreateDevice reports
+        // VUID-vkCreateDevice-ppEnabledExtensionNames-01387.
+        extensions.push_back(
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+
         if (enableValidationLayers) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
@@ -269,6 +295,59 @@ private:
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(physicalDevice, &properties);
         std::cout << "Selected GPU: " << properties.deviceName << std::endl;
+    }
+
+    void createLogicalDevice() {
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+
+        VkDeviceQueueCreateInfo queueCreateInfo{};
+        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfo.queueFamilyIndex =
+            indices.graphicsAndComputeFamily.value();
+        queueCreateInfo.queueCount = 1;
+
+        // Required even with a single queue: relative scheduling priority
+        // in [0.0, 1.0], used when queues contend for the GPU.
+        float queuePriority = 1.0f;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+
+        // No optional hardware features requested yet. Vulkan will not let
+        // us use a feature we did not ask for here, even if the hardware
+        // supports it -- knowing this up front is what lets the driver
+        // specialise.
+        VkPhysicalDeviceFeatures deviceFeatures{};
+
+        VkDeviceCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        createInfo.pQueueCreateInfos = &queueCreateInfo;
+        createInfo.queueCreateInfoCount = 1;
+        createInfo.pEnabledFeatures = &deviceFeatures;
+
+        createInfo.enabledExtensionCount =
+            static_cast<uint32_t>(deviceExtensions.size());
+        createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+
+        // The tutorial sets device-level layers here "for compatibility with
+        // older implementations". That advice is now out of date: the current
+        // spec requires enabledLayerCount to be 0
+        // (VUID-VkDeviceCreateInfo-enabledLayerCount-12384). Device layers
+        // were removed, not just deprecated; the instance-level layers cover
+        // device calls.
+        createInfo.enabledLayerCount = 0;
+
+        if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create logical device!");
+        }
+
+        // The queue already exists -- it was created alongside the device
+        // from queueCreateInfo above. This only fetches a handle to it.
+        vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 0,
+                         &graphicsAndComputeQueue);
+
+        std::cout << "Logical device created; graphics+compute queue "
+                     "retrieved from family index "
+                  << indices.graphicsAndComputeFamily.value() << std::endl;
     }
 
     bool isDeviceSuitable(VkPhysicalDevice device) {
@@ -345,8 +424,11 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order. The messenger was made from the instance,
-        // so it goes first; the instance outlives everything made through it.
+        // Reverse creation order. The device was made from the instance and
+        // owns the queue, so it goes first; the messenger next; the instance
+        // outlives everything made through it.
+        vkDestroyDevice(device, nullptr);
+
         if (enableValidationLayers) {
             DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         }
