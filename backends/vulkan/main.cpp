@@ -1,11 +1,11 @@
 // Vulkan backend entry point.
 //
-// Phase 1, step 3 -- vulkan-tutorial.com "Validation layers":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Validation_layers
+// Phase 1, step 4 -- vulkan-tutorial.com "Physical devices and queue
+// families":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Physical_devices_and_queue_families
 //
-// Turns on the Khronos validation layer and routes its messages to a
-// callback, so incorrect API use is reported in English instead of
-// silently producing undefined behaviour.
+// Enumerates the GPUs the instance can see and picks one that exposes a
+// queue family supporting both graphics and compute work.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -56,6 +57,21 @@ void DestroyDebugUtilsMessengerEXT(
     }
 }
 
+// Any uint32_t is a valid queue family index, including 0, so there is no
+// number free to mean "not found". optional carries that separately.
+//
+// Deviation from the tutorial, per the roadmap: it looks for a graphics-only
+// family. This backend will submit compute work too, and on Apple Silicon one
+// family serves both, so both bits are required here rather than revisiting
+// this in Phase 3.
+struct QueueFamilyIndices {
+    std::optional<uint32_t> graphicsAndComputeFamily;
+
+    bool isComplete() {
+        return graphicsAndComputeFamily.has_value();
+    }
+};
+
 class vulkan_app {
 public:
     void run() {
@@ -69,6 +85,11 @@ private:
     GLFWwindow* window;
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;
+
+    // Not created and not destroyed -- this is a handle to hardware that
+    // already exists. It is released implicitly with the instance, which is
+    // why it never appears in cleanup().
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 
     void initWindow() {
         glfwInit();
@@ -88,6 +109,7 @@ private:
     void initVulkan() {
         createInstance();
         setupDebugMessenger();
+        pickPhysicalDevice();
     }
 
     void createInstance() {
@@ -220,6 +242,70 @@ private:
                 instance, &createInfo, nullptr, &debugMessenger) != VK_SUCCESS) {
             throw std::runtime_error("failed to set up debug messenger!");
         }
+    }
+
+    void pickPhysicalDevice() {
+        uint32_t deviceCount = 0;
+        vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+
+        if (deviceCount == 0) {
+            throw std::runtime_error("failed to find GPUs with Vulkan support!");
+        }
+
+        std::vector<VkPhysicalDevice> devices(deviceCount);
+        vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+
+        for (const auto& device : devices) {
+            if (isDeviceSuitable(device)) {
+                physicalDevice = device;
+                break;
+            }
+        }
+
+        if (physicalDevice == VK_NULL_HANDLE) {
+            throw std::runtime_error("failed to find a suitable GPU!");
+        }
+
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        std::cout << "Selected GPU: " << properties.deviceName << std::endl;
+    }
+
+    bool isDeviceSuitable(VkPhysicalDevice device) {
+        QueueFamilyIndices indices = findQueueFamilies(device);
+        return indices.isComplete();
+    }
+
+    // A queue family is a group of queues that all accept the same kinds of
+    // work. Commands are recorded into buffers and submitted to a queue, so
+    // we need a family whose advertised capabilities cover what we intend to
+    // submit -- here, graphics and compute.
+    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) {
+        QueueFamilyIndices indices;
+
+        uint32_t queueFamilyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(
+            device, &queueFamilyCount, nullptr);
+
+        std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(
+            device, &queueFamilyCount, queueFamilies.data());
+
+        int i = 0;
+        for (const auto& queueFamily : queueFamilies) {
+            if ((queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                (queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+                indices.graphicsAndComputeFamily = i;
+            }
+
+            if (indices.isComplete()) {
+                break;
+            }
+
+            i++;
+        }
+
+        return indices;
     }
 
     // Returning VK_FALSE means "do not abort the call that triggered this".
