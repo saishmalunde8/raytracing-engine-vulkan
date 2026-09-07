@@ -1,12 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 1a -- vulkan-tutorial.com "Window surface":
+// Phase 2, step 1b -- vulkan-tutorial.com "Window surface":
 // https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Window_surface
 //
-// Creates the VkSurfaceKHR bridging Vulkan and the macOS window. Core Vulkan
-// knows nothing about windows -- it is specified to run headless -- so
-// presentation lives entirely in extensions, and the surface is the
-// platform-neutral handle to whatever we will eventually present to.
+// Finds a queue family that can present to the surface and opens the device
+// with one queue per unique family. Presentation is not a queueFlags bit --
+// there is no VK_QUEUE_PRESENT_BIT -- because the answer depends on which
+// surface, so it has to be asked about the family/surface pair.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -79,8 +80,14 @@ void DestroyDebugUtilsMessengerEXT(
 struct QueueFamilyIndices {
     std::optional<uint32_t> graphicsAndComputeFamily;
 
+    // Kept separate from the one above because nothing guarantees they are
+    // the same family. They happen to be on Apple Silicon; assuming that in
+    // the type would be assuming the hardware.
+    std::optional<uint32_t> presentFamily;
+
     bool isComplete() {
-        return graphicsAndComputeFamily.has_value();
+        return graphicsAndComputeFamily.has_value() &&
+               presentFamily.has_value();
     }
 };
 
@@ -112,8 +119,10 @@ private:
     VkDevice device;
 
     // Queues are created with the device and die with it, so there is no
-    // destroy call for this -- it is only a handle to one that already exists.
+    // destroy call for these -- they are only handles to ones that already
+    // exist. On this GPU both names are expected to resolve to the same queue.
     VkQueue graphicsAndComputeQueue;
+    VkQueue presentQueue;
 
     void initWindow() {
         glfwInit();
@@ -322,16 +331,28 @@ private:
     void createLogicalDevice() {
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
 
-        VkDeviceQueueCreateInfo queueCreateInfo{};
-        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queueCreateInfo.queueFamilyIndex =
-            indices.graphicsAndComputeFamily.value();
-        queueCreateInfo.queueCount = 1;
+        // vkCreateDevice rejects the same family index appearing twice in
+        // pQueueCreateInfos (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802),
+        // so the set is not tidiness -- it is what stops a validation error on
+        // hardware where the two roles share a family, as here.
+        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+        std::set<uint32_t> uniqueQueueFamilies = {
+            indices.graphicsAndComputeFamily.value(),
+            indices.presentFamily.value()
+        };
 
         // Required even with a single queue: relative scheduling priority
         // in [0.0, 1.0], used when queues contend for the GPU.
         float queuePriority = 1.0f;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+
+        for (uint32_t queueFamily : uniqueQueueFamilies) {
+            VkDeviceQueueCreateInfo queueCreateInfo{};
+            queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueCreateInfo.queueFamilyIndex = queueFamily;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfos.push_back(queueCreateInfo);
+        }
 
         // No optional hardware features requested yet. Vulkan will not let
         // us use a feature we did not ask for here, even if the hardware
@@ -341,8 +362,9 @@ private:
 
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        createInfo.pQueueCreateInfos = &queueCreateInfo;
-        createInfo.queueCreateInfoCount = 1;
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
+        createInfo.queueCreateInfoCount =
+            static_cast<uint32_t>(queueCreateInfos.size());
         createInfo.pEnabledFeatures = &deviceFeatures;
 
         createInfo.enabledExtensionCount =
@@ -362,14 +384,22 @@ private:
             throw std::runtime_error("failed to create logical device!");
         }
 
-        // The queue already exists -- it was created alongside the device
-        // from queueCreateInfo above. This only fetches a handle to it.
+        // The queues already exist -- they were created alongside the device
+        // from queueCreateInfos above. This only fetches handles to them.
         vkGetDeviceQueue(device, indices.graphicsAndComputeFamily.value(), 0,
                          &graphicsAndComputeQueue);
+        vkGetDeviceQueue(device, indices.presentFamily.value(), 0,
+                         &presentQueue);
 
-        std::cout << "Logical device created; graphics+compute queue "
-                     "retrieved from family index "
-                  << indices.graphicsAndComputeFamily.value() << std::endl;
+        std::cout << "Logical device created from "
+                  << queueCreateInfos.size() << " queue create info(s):\n"
+                  << "\tgraphics+compute family "
+                  << indices.graphicsAndComputeFamily.value() << "\n"
+                  << "\tpresent family          "
+                  << indices.presentFamily.value() << "\n"
+                  << "\tsame VkQueue handle:    "
+                  << (graphicsAndComputeQueue == presentQueue ? "yes" : "no")
+                  << std::endl;
     }
 
     bool isDeviceSuitable(VkPhysicalDevice device) {
@@ -397,6 +427,17 @@ private:
             if ((queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
                 (queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                 indices.graphicsAndComputeFamily = i;
+            }
+
+            // No queueFlags bit exists for this. Whether a family can present
+            // is a property of the family *and* a particular surface -- on a
+            // two-GPU machine the display may be wired to the other one -- so
+            // it is a question about the pair, not a capability to read off.
+            VkBool32 presentSupport = false;
+            vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface,
+                                                 &presentSupport);
+            if (presentSupport) {
+                indices.presentFamily = i;
             }
 
             if (indices.isComplete()) {
