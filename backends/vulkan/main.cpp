@@ -1,12 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 1b -- vulkan-tutorial.com "Window surface":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Window_surface
+// Phase 2, step 2a -- vulkan-tutorial.com "Swap chain":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain
 //
-// Finds a queue family that can present to the surface and opens the device
-// with one queue per unique family. Presentation is not a queueFlags bit --
-// there is no VK_QUEUE_PRESENT_BIT -- because the answer depends on which
-// surface, so it has to be asked about the family/surface pair.
+// Decides whether a GPU can have a swapchain at all: does it advertise
+// VK_KHR_swapchain, and does it actually offer usable formats and present
+// modes for our surface? Those are separate questions -- the extension list
+// is a property of the device, what a swapchain can do is a property of the
+// device and surface together. No swapchain is created yet.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 const uint32_t WIDTH = 800;
@@ -34,6 +36,9 @@ const std::vector<const char*> validationLayers = {
 // it on any device that advertises it, and the tutorial does not emphasise
 // that -- omitting it trips validation errors later rather than here.
 const std::vector<const char*> deviceExtensions = {
+    // Presenting is a per-device capability, so the swapchain is a DEVICE
+    // extension -- unlike the instance-level ones enabled in Phase 1.
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     "VK_KHR_portability_subset"
 };
 
@@ -89,6 +94,15 @@ struct QueueFamilyIndices {
         return graphicsAndComputeFamily.has_value() &&
                presentFamily.has_value();
     }
+};
+
+// Everything vkCreateSwapchainKHR will need in the next two steps. Each of
+// these is a property of a device/surface *pair* rather than of either alone,
+// which is why all three queries below take the surface.
+struct SwapChainSupportDetails {
+    VkSurfaceCapabilitiesKHR capabilities;   // image count and extent bounds
+    std::vector<VkSurfaceFormatKHR> formats; // (format, colorSpace) pairs
+    std::vector<VkPresentModeKHR> presentModes;
 };
 
 class vulkan_app {
@@ -326,6 +340,20 @@ private:
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(physicalDevice, &properties);
         std::cout << "Selected GPU: " << properties.deviceName << std::endl;
+
+        // maxImageCount of 0 is not "none available" -- it is the spec's way
+        // of saying there is no upper limit beyond memory.
+        SwapChainSupportDetails support = querySwapChainSupport(physicalDevice);
+        std::cout << "Swapchain support for this surface:\n"
+                  << "\tsurface formats: " << support.formats.size() << "\n"
+                  << "\tpresent modes:   " << support.presentModes.size()
+                  << "\n"
+                  << "\timage count:     "
+                  << support.capabilities.minImageCount << " min, "
+                  << support.capabilities.maxImageCount << " max"
+                  << (support.capabilities.maxImageCount == 0
+                          ? " (0 = no limit)" : "")
+                  << std::endl;
     }
 
     void createLogicalDevice() {
@@ -404,7 +432,73 @@ private:
 
     bool isDeviceSuitable(VkPhysicalDevice device) {
         QueueFamilyIndices indices = findQueueFamilies(device);
-        return indices.isComplete();
+
+        bool extensionsSupported = checkDeviceExtensionSupport(device);
+
+        // Must stay inside the guard: calling the surface queries on a device
+        // that does not support VK_KHR_swapchain is undefined, not a graceful
+        // failure. And supporting the extension is not the same as having
+        // anything usable for *this* surface -- hence the second check.
+        bool swapChainAdequate = false;
+        if (extensionsSupported) {
+            SwapChainSupportDetails swapChainSupport =
+                querySwapChainSupport(device);
+            swapChainAdequate = !swapChainSupport.formats.empty() &&
+                                !swapChainSupport.presentModes.empty();
+        }
+
+        return indices.isComplete() && extensionsSupported &&
+               swapChainAdequate;
+    }
+
+    // vkEnumerateDeviceExtensionProperties, not the Instance version used in
+    // Phase 1 -- same two-call count-then-fill shape, different scope. Erasing
+    // from a set of the required names leaves it empty only if all were found.
+    bool checkDeviceExtensionSupport(VkPhysicalDevice device) {
+        uint32_t extensionCount;
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount,
+                                             nullptr);
+
+        std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount,
+                                             availableExtensions.data());
+
+        std::set<std::string> requiredExtensions(deviceExtensions.begin(),
+                                                 deviceExtensions.end());
+
+        for (const auto& extension : availableExtensions) {
+            requiredExtensions.erase(extension.extensionName);
+        }
+
+        return requiredExtensions.empty();
+    }
+
+    SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) {
+        SwapChainSupportDetails details;
+
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface,
+                                                  &details.capabilities);
+
+        uint32_t formatCount;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount,
+                                             nullptr);
+        if (formatCount != 0) {
+            details.formats.resize(formatCount);
+            vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount,
+                                                 details.formats.data());
+        }
+
+        uint32_t presentModeCount;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface,
+                                                  &presentModeCount, nullptr);
+        if (presentModeCount != 0) {
+            details.presentModes.resize(presentModeCount);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(
+                device, surface, &presentModeCount,
+                details.presentModes.data());
+        }
+
+        return details;
     }
 
     // A queue family is a group of queues that all accept the same kinds of
