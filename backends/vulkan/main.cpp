@@ -1,11 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 2c -- vulkan-tutorial.com "Swap chain":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain
+// Phase 2, step 3 -- vulkan-tutorial.com "Image views":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Image_views
 //
-// Creates the VkSwapchainKHR from the settings chosen in 2b and retrieves the
-// images it manages. Those images are owned by the swapchain, not by us --
-// they are destroyed with it, which is why cleanup() never touches them.
+// Wraps each swapchain image in a VkImageView. An image is memory with a
+// format; a view says how to access it -- which part, as what type, with what
+// channel mapping. Nothing in Vulkan binds an image directly; it binds a
+// view. Unlike the images they wrap, these views are ours to destroy.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -144,10 +145,13 @@ private:
     // instance: destroyed implicitly with it, never by us.
     std::vector<VkImage> swapChainImages;
 
-    // Kept because the image views (step 3), render pass (6a), framebuffers
+    // Kept because the image views below, the render pass (6a), framebuffers
     // (7) and viewport (5) all need them again.
     VkFormat swapChainImageFormat;
     VkExtent2D swapChainExtent;
+
+    // Ours, unlike swapChainImages: created by us, so destroyed by us.
+    std::vector<VkImageView> swapChainImageViews;
 
     void initWindow() {
         glfwInit();
@@ -171,6 +175,7 @@ private:
         pickPhysicalDevice();
         createLogicalDevice();
         createSwapChain();
+        createImageViews();
     }
 
     void createInstance() {
@@ -696,6 +701,47 @@ private:
                   << swapChainExtent.height << std::endl;
     }
 
+    void createImageViews() {
+        swapChainImageViews.resize(swapChainImages.size());
+
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            VkImageViewCreateInfo createInfo{};
+            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image = swapChainImages[i];
+
+            // How to read it: a plain 2D texture, in the format the swapchain
+            // was created with -- which is why step 2c kept that around.
+            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            createInfo.format = swapChainImageFormat;
+
+            // The swizzle. IDENTITY throughout means no channel remapping;
+            // this is where you would broadcast red to every channel for a
+            // monochrome view without touching the image underneath.
+            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+
+            // Which part of the image the view covers: colour data rather than
+            // depth or stencil, no mipmaps, and one array layer -- which has
+            // to agree with the imageArrayLayers = 1 set in step 2c.
+            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            createInfo.subresourceRange.baseMipLevel = 0;
+            createInfo.subresourceRange.levelCount = 1;
+            createInfo.subresourceRange.baseArrayLayer = 0;
+            createInfo.subresourceRange.layerCount = 1;
+
+            if (vkCreateImageView(device, &createInfo, nullptr,
+                                  &swapChainImageViews[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create image views!");
+            }
+        }
+
+        std::cout << "Image views created: " << swapChainImageViews.size()
+                  << " for " << swapChainImages.size()
+                  << " swapchain image(s)" << std::endl;
+    }
+
     // A queue family is a group of queues that all accept the same kinds of
     // work. Commands are recorded into buffers and submitted to a queue, so
     // we need a family whose advertised capabilities cover what we intend to
@@ -776,10 +822,15 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order. The swapchain was made from the device, so
-        // it goes before it; the messenger next; the instance outlives
-        // everything made through it. The swapchain's VkImages need no calls
-        // of their own -- they go with the swapchain.
+        // Reverse creation order. The views go before the swapchain, since
+        // they reference images it owns; the swapchain before the device that
+        // made it; the messenger next; the instance outlives everything made
+        // through it. The swapchain's VkImages need no calls of their own --
+        // they go with the swapchain.
+        for (auto imageView : swapChainImageViews) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
+
         vkDestroySwapchainKHR(device, swapChain, nullptr);
 
         vkDestroyDevice(device, nullptr);
