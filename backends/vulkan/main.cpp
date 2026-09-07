@@ -1,11 +1,11 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 2b -- vulkan-tutorial.com "Swap chain":
+// Phase 2, step 2c -- vulkan-tutorial.com "Swap chain":
 // https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain
 //
-// Picks the three settings a swapchain is built from -- surface format,
-// present mode and extent -- out of what step 2a found available. Pure
-// choices over already-queried data; still no Vulkan objects created.
+// Creates the VkSwapchainKHR from the settings chosen in 2b and retrieves the
+// images it manages. Those images are owned by the swapchain, not by us --
+// they are destroyed with it, which is why cleanup() never touches them.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -138,6 +138,17 @@ private:
     VkQueue graphicsAndComputeQueue;
     VkQueue presentQueue;
 
+    VkSwapchainKHR swapChain;
+
+    // Owned by the swapchain, like the physical device is owned by the
+    // instance: destroyed implicitly with it, never by us.
+    std::vector<VkImage> swapChainImages;
+
+    // Kept because the image views (step 3), render pass (6a), framebuffers
+    // (7) and viewport (5) all need them again.
+    VkFormat swapChainImageFormat;
+    VkExtent2D swapChainExtent;
+
     void initWindow() {
         glfwInit();
 
@@ -159,7 +170,7 @@ private:
         createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
-        reportSwapChainChoices();
+        createSwapChain();
     }
 
     void createInstance() {
@@ -577,45 +588,112 @@ private:
         }
     }
 
-    // Temporary, for this step's checkpoint only: the three choosers above
-    // have no real caller until createSwapChain() arrives in step 2c, which
-    // replaces the call to this in initVulkan().
-    void reportSwapChainChoices() {
-        SwapChainSupportDetails support = querySwapChainSupport(physicalDevice);
+    void createSwapChain() {
+        SwapChainSupportDetails swapChainSupport =
+            querySwapChainSupport(physicalDevice);
 
-        VkSurfaceFormatKHR format = chooseSwapSurfaceFormat(support.formats);
-        VkPresentModeKHR mode = chooseSwapPresentMode(support.presentModes);
-        VkExtent2D extent = chooseSwapExtent(support.capabilities);
+        VkSurfaceFormatKHR surfaceFormat =
+            chooseSwapSurfaceFormat(swapChainSupport.formats);
+        VkPresentModeKHR presentMode =
+            chooseSwapPresentMode(swapChainSupport.presentModes);
+        VkExtent2D extent = chooseSwapExtent(swapChainSupport.capabilities);
 
-        bool preferredFormat =
-            format.format == VK_FORMAT_B8G8R8A8_SRGB &&
-            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        bool surfaceDictatedExtent =
-            support.capabilities.currentExtent.width !=
-            std::numeric_limits<uint32_t>::max();
+        // One more than the minimum: sitting at exactly minImageCount can mean
+        // waiting on the driver's internal work before an image is available.
+        uint32_t imageCount = swapChainSupport.capabilities.minImageCount + 1;
 
-        std::cout << "Swapchain settings chosen:\n\tmodes offered: ";
-        for (const auto& m : support.presentModes) {
-            std::cout << presentModeName(m) << ' ';
+        // maxImageCount of 0 means "no limit", so it must not be read as a
+        // ceiling of zero. Here max is 3 and min+1 is 3 -- exactly at the top.
+        if (swapChainSupport.capabilities.maxImageCount > 0 &&
+            imageCount > swapChainSupport.capabilities.maxImageCount) {
+            imageCount = swapChainSupport.capabilities.maxImageCount;
         }
-        std::cout << "\n\tformat:        "
-                  << (preferredFormat ? "B8G8R8A8_SRGB + SRGB_NONLINEAR"
-                                      : "fallback formats[0]")
-                  << "\n\tpresent mode:  " << presentModeName(mode)
-                  << "\n\textent:        " << extent.width << "x"
-                  << extent.height
-                  << (surfaceDictatedExtent ? " (from currentExtent)"
-                                            : " (from glfwGetFramebufferSize)")
-                  << std::endl;
 
-        // Printed either way, so the Retina 2x gap is visible even when the
-        // framebuffer-size branch above never runs.
-        int winW, winH, fbW, fbH;
-        glfwGetWindowSize(window, &winW, &winH);
-        glfwGetFramebufferSize(window, &fbW, &fbH);
-        std::cout << "\tGLFW reports:  " << winW << "x" << winH
-                  << " screen coords, " << fbW << "x" << fbH << " pixels"
-                  << std::endl;
+        VkSwapchainCreateInfoKHR createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        createInfo.surface = surface;
+
+        createInfo.minImageCount = imageCount;
+        createInfo.imageFormat = surfaceFormat.format;
+        createInfo.imageColorSpace = surfaceFormat.colorSpace;
+        createInfo.imageExtent = extent;
+
+        // Always 1 unless rendering stereoscopic 3D, where an image would
+        // carry one layer per eye.
+        createInfo.imageArrayLayers = 1;
+
+        // We draw straight into these images. This stays COLOR_ATTACHMENT
+        // rather than becoming a transfer destination, because the Phase 5
+        // compute output lands in a separate storage image that a fullscreen
+        // pass samples.
+        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        uint32_t queueFamilyIndices[] = {
+            indices.graphicsAndComputeFamily.value(),
+            indices.presentFamily.value()
+        };
+
+        // EXCLUSIVE: one queue family owns an image at a time and ownership
+        // must be handed over explicitly -- the fast path, and what we take
+        // here since step 1b showed both roles are family 0. CONCURRENT drops
+        // the transfer requirement at a cost. Both branches exist so this stays
+        // correct on hardware where the families differ.
+        if (indices.graphicsAndComputeFamily != indices.presentFamily) {
+            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+            createInfo.queueFamilyIndexCount = 2;
+            createInfo.pQueueFamilyIndices = queueFamilyIndices;
+        } else {
+            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        }
+
+        // No rotation or flip -- hand back the transform the surface already
+        // reports. Mobile drivers use this field for screen orientation.
+        createInfo.preTransform =
+            swapChainSupport.capabilities.currentTransform;
+
+        // Ignore alpha when compositing against other windows on the desktop.
+        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+
+        createInfo.presentMode = presentMode;
+
+        // Lets the implementation skip work on pixels hidden behind another
+        // window. Only unsafe if we needed to read those pixels back.
+        createInfo.clipped = VK_TRUE;
+
+        // Becomes meaningful in step 11a, where a resize builds a replacement
+        // swapchain and passes the outgoing one in here.
+        createInfo.oldSwapchain = VK_NULL_HANDLE;
+
+        if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapChain) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create swap chain!");
+        }
+
+        // The field above is a *minimum*; the implementation is free to make
+        // more, so the real count is asked for rather than assumed.
+        vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
+        swapChainImages.resize(imageCount);
+        vkGetSwapchainImagesKHR(device, swapChain, &imageCount,
+                                swapChainImages.data());
+
+        swapChainImageFormat = surfaceFormat.format;
+        swapChainExtent = extent;
+
+        std::cout << "Swapchain created:\n"
+                  << "\timages:       " << swapChainImages.size()
+                  << " (requested at least " << createInfo.minImageCount
+                  << ")\n"
+                  << "\tformat:       " << swapChainImageFormat
+                  << (swapChainImageFormat == VK_FORMAT_B8G8R8A8_SRGB
+                          ? " (B8G8R8A8_SRGB)" : "")
+                  << "\n\tpresent mode: " << presentModeName(presentMode)
+                  << "\n\tsharing mode: "
+                  << (createInfo.imageSharingMode ==
+                              VK_SHARING_MODE_EXCLUSIVE
+                          ? "EXCLUSIVE" : "CONCURRENT")
+                  << "\n\textent:       " << swapChainExtent.width << "x"
+                  << swapChainExtent.height << std::endl;
     }
 
     // A queue family is a group of queues that all accept the same kinds of
@@ -698,9 +776,12 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order. The device was made from the instance and
-        // owns the queue, so it goes first; the messenger next; the instance
-        // outlives everything made through it.
+        // Reverse creation order. The swapchain was made from the device, so
+        // it goes before it; the messenger next; the instance outlives
+        // everything made through it. The swapchain's VkImages need no calls
+        // of their own -- they go with the swapchain.
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
+
         vkDestroyDevice(device, nullptr);
 
         if (enableValidationLayers) {
