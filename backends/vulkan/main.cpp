@@ -1,20 +1,20 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 2a -- vulkan-tutorial.com "Swap chain":
+// Phase 2, step 2b -- vulkan-tutorial.com "Swap chain":
 // https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Swap_chain
 //
-// Decides whether a GPU can have a swapchain at all: does it advertise
-// VK_KHR_swapchain, and does it actually offer usable formats and present
-// modes for our surface? Those are separate questions -- the extension list
-// is a property of the device, what a swapchain can do is a property of the
-// device and surface together. No swapchain is created yet.
+// Picks the three settings a swapchain is built from -- surface format,
+// present mode and extent -- out of what step 2a found available. Pure
+// choices over already-queried data; still no Vulkan objects created.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -159,6 +159,7 @@ private:
         createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
+        reportSwapChainChoices();
     }
 
     void createInstance() {
@@ -499,6 +500,122 @@ private:
         }
 
         return details;
+    }
+
+    // Chosen deliberately rather than just taking formats[0]. An _SRGB format
+    // makes the hardware do the linear<->sRGB conversion on read and write.
+    // That matters here: a path tracer accumulates linear radiance, and
+    // something has to gamma-encode it before display. Letting the swapchain
+    // do it is free -- but then the shader must NOT also gamma-correct in
+    // Phase 6, or the correction lands twice and the image washes out.
+    VkSurfaceFormatKHR chooseSwapSurfaceFormat(
+        const std::vector<VkSurfaceFormatKHR>& availableFormats) {
+        for (const auto& availableFormat : availableFormats) {
+            if (availableFormat.format == VK_FORMAT_B8G8R8A8_SRGB &&
+                availableFormat.colorSpace ==
+                    VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                return availableFormat;
+            }
+        }
+
+        // Safe only because step 2a rejects any device with no formats.
+        return availableFormats[0];
+    }
+
+    // FIFO is the one mode the spec guarantees every implementation offers,
+    // which is what makes it the fallback rather than a preference. MAILBOX
+    // gives the same no-tearing promise without blocking the submitting
+    // thread -- lower latency, more power.
+    VkPresentModeKHR chooseSwapPresentMode(
+        const std::vector<VkPresentModeKHR>& availablePresentModes) {
+        for (const auto& availablePresentMode : availablePresentModes) {
+            if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                return availablePresentMode;
+            }
+        }
+
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+
+    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities) {
+        // A currentExtent of UINT32_MAX is the window system saying "pick
+        // whatever you like"; any other value is a size we must match.
+        if (capabilities.currentExtent.width !=
+            std::numeric_limits<uint32_t>::max()) {
+            return capabilities.currentExtent;
+        }
+
+        // GLFW measures windows in screen coordinates; Vulkan works in pixels.
+        // On a Retina display they differ by 2x, so glfwGetWindowSize here
+        // would build a swapchain a quarter of the needed size -- the classic
+        // "image in the corner" bug. glfwGetFramebufferSize returns pixels.
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+
+        VkExtent2D actualExtent = {
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height)
+        };
+
+        actualExtent.width = std::clamp(actualExtent.width,
+                                        capabilities.minImageExtent.width,
+                                        capabilities.maxImageExtent.width);
+        actualExtent.height = std::clamp(actualExtent.height,
+                                         capabilities.minImageExtent.height,
+                                         capabilities.maxImageExtent.height);
+
+        return actualExtent;
+    }
+
+    static const char* presentModeName(VkPresentModeKHR mode) {
+        switch (mode) {
+            case VK_PRESENT_MODE_IMMEDIATE_KHR:    return "IMMEDIATE";
+            case VK_PRESENT_MODE_MAILBOX_KHR:      return "MAILBOX";
+            case VK_PRESENT_MODE_FIFO_KHR:         return "FIFO";
+            case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+            default:                               return "other";
+        }
+    }
+
+    // Temporary, for this step's checkpoint only: the three choosers above
+    // have no real caller until createSwapChain() arrives in step 2c, which
+    // replaces the call to this in initVulkan().
+    void reportSwapChainChoices() {
+        SwapChainSupportDetails support = querySwapChainSupport(physicalDevice);
+
+        VkSurfaceFormatKHR format = chooseSwapSurfaceFormat(support.formats);
+        VkPresentModeKHR mode = chooseSwapPresentMode(support.presentModes);
+        VkExtent2D extent = chooseSwapExtent(support.capabilities);
+
+        bool preferredFormat =
+            format.format == VK_FORMAT_B8G8R8A8_SRGB &&
+            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        bool surfaceDictatedExtent =
+            support.capabilities.currentExtent.width !=
+            std::numeric_limits<uint32_t>::max();
+
+        std::cout << "Swapchain settings chosen:\n\tmodes offered: ";
+        for (const auto& m : support.presentModes) {
+            std::cout << presentModeName(m) << ' ';
+        }
+        std::cout << "\n\tformat:        "
+                  << (preferredFormat ? "B8G8R8A8_SRGB + SRGB_NONLINEAR"
+                                      : "fallback formats[0]")
+                  << "\n\tpresent mode:  " << presentModeName(mode)
+                  << "\n\textent:        " << extent.width << "x"
+                  << extent.height
+                  << (surfaceDictatedExtent ? " (from currentExtent)"
+                                            : " (from glfwGetFramebufferSize)")
+                  << std::endl;
+
+        // Printed either way, so the Retina 2x gap is visible even when the
+        // framebuffer-size branch above never runs.
+        int winW, winH, fbW, fbH;
+        glfwGetWindowSize(window, &winW, &winH);
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        std::cout << "\tGLFW reports:  " << winW << "x" << winH
+                  << " screen coords, " << fbW << "x" << fbH << " pixels"
+                  << std::endl;
     }
 
     // A queue family is a group of queues that all accept the same kinds of
