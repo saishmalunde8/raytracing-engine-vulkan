@@ -1,12 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 3 -- vulkan-tutorial.com "Image views":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Presentation/Image_views
+// Phase 2, step 4b -- vulkan-tutorial.com "Shader modules":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Shader_modules
 //
-// Wraps each swapchain image in a VkImageView. An image is memory with a
-// format; a view says how to access it -- which part, as what type, with what
-// channel mapping. Nothing in Vulkan binds an image directly; it binds a
-// view. Unlike the images they wrap, these views are ours to destroy.
+// Loads the SPIR-V the build produced and wraps it in VkShaderModules. These
+// are the first objects that do NOT live until cleanup(): a module is only a
+// compilation input, so it is destroyed at the end of the function that made
+// it, once the pipeline has taken what it needs.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -176,6 +177,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createGraphicsPipeline();
     }
 
     void createInstance() {
@@ -740,6 +742,102 @@ private:
         std::cout << "Image views created: " << swapChainImageViews.size()
                   << " for " << swapChainImages.size()
                   << " swapchain image(s)" << std::endl;
+    }
+
+    // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
+    // depend on which directory the program is launched from.
+    static std::vector<char> readFile(const std::string& filename) {
+        // ate = start at the end, so tellg() gives the size straight away
+        // without a separate stat. binary stops newline translation from
+        // corrupting the bytecode on platforms that would do it.
+        std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open file: " + filename);
+        }
+
+        size_t fileSize = (size_t) file.tellg();
+        std::vector<char> buffer(fileSize);
+
+        file.seekg(0);
+        file.read(buffer.data(), fileSize);
+        file.close();
+
+        return buffer;
+    }
+
+    VkShaderModule createShaderModule(const std::vector<char>& code) {
+        VkShaderModuleCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        createInfo.codeSize = code.size();
+
+        // codeSize counts bytes but pCode is uint32_t*, because SPIR-V is a
+        // stream of 32-bit words. The cast is safe only because vector's
+        // allocator guarantees alignment for any scalar type -- the same cast
+        // off a raw char array on the stack would be undefined behaviour.
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr,
+                                 &shaderModule) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create shader module!");
+        }
+
+        return shaderModule;
+    }
+
+    void createGraphicsPipeline() {
+        auto vertShaderCode =
+            readFile(std::string(SHADER_BINARY_DIR) + "/shader.vert.spv");
+        auto fragShaderCode =
+            readFile(std::string(SHADER_BINARY_DIR) + "/shader.frag.spv");
+
+        VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+        VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+
+        VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
+        vertShaderStageInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        vertShaderStageInfo.module = vertShaderModule;
+
+        // The entry point to run. A SPIR-V module can hold several, which is
+        // why this is named rather than implied; glslc only ever emits "main".
+        // pSpecializationInfo is left null, but it is how constants get baked
+        // in at pipeline-creation time -- the natural home for the path
+        // tracer's MAX_DEPTH later, instead of recompiling GLSL.
+        vertShaderStageInfo.pName = "main";
+
+        VkPipelineShaderStageCreateInfo fragShaderStageInfo{};
+        fragShaderStageInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragShaderStageInfo.module = fragShaderModule;
+        fragShaderStageInfo.pName = "main";
+
+        VkPipelineShaderStageCreateInfo shaderStages[] = {
+            vertShaderStageInfo,
+            fragShaderStageInfo
+        };
+
+        std::cout << "Shader stages prepared: "
+                  << sizeof(shaderStages) / sizeof(shaderStages[0]) << "\n"
+                  << "\tvertex:   " << vertShaderCode.size()
+                  << " bytes SPIR-V, entry point \""
+                  << shaderStages[0].pName << "\"\n"
+                  << "\tfragment: " << fragShaderCode.size()
+                  << " bytes SPIR-V, entry point \""
+                  << shaderStages[1].pName << "\"" << std::endl;
+
+        // Step 5 (fixed functions) and 6a (render pass) fill the gap here.
+        // Step 6b consumes shaderStages in vkCreateGraphicsPipelines.
+
+        // Destroyed here, not in cleanup(). A shader module is only an input
+        // to pipeline creation; once the pipeline exists it holds the compiled
+        // machine code and these are dead weight. Reverse order of creation,
+        // for the same reason as everywhere else.
+        vkDestroyShaderModule(device, fragShaderModule, nullptr);
+        vkDestroyShaderModule(device, vertShaderModule, nullptr);
     }
 
     // A queue family is a group of queues that all accept the same kinds of
