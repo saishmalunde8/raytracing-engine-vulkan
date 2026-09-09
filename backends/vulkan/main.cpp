@@ -1,13 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 5 -- vulkan-tutorial.com "Fixed functions":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
+// Phase 2, step 6a -- vulkan-tutorial.com "Render passes":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
 //
-// Describes every part of the pipeline that is not programmable. A VkPipeline
-// is immutable, so nearly all render state is baked in at creation and the
-// driver optimises once instead of patching shaders at draw time. Viewport
-// and scissor are the exception, left dynamic so a resize does not force a
-// pipeline rebuild. Creates one object: the VkPipelineLayout.
+// Declares what is drawn into and what happens to it at the boundaries: which
+// attachments exist, whether their contents are cleared or preserved on entry
+// and kept or discarded on exit, and which memory layouts they move between.
+// Declaring this up front is what lets a tile-based GPU -- an M1 -- skip
+// reading and writing tiles it does not need.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -155,6 +155,8 @@ private:
     // Ours, unlike swapChainImages: created by us, so destroyed by us.
     std::vector<VkImageView> swapChainImageViews;
 
+    VkRenderPass renderPass;
+
     // The shaders' uniform interface -- empty for now. Unlike the shader
     // modules, this outlives pipeline creation, so it is freed in cleanup().
     VkPipelineLayout pipelineLayout;
@@ -182,6 +184,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createRenderPass();
         createGraphicsPipeline();
     }
 
@@ -749,6 +752,85 @@ private:
                   << " swapchain image(s)" << std::endl;
     }
 
+    void createRenderPass() {
+        VkAttachmentDescription colorAttachment{};
+
+        // Must match the swapchain's format: step 7 backs these attachments
+        // with the swapchain images themselves.
+        colorAttachment.format = swapChainImageFormat;
+
+        // One sample, agreeing with the multisampling-off choice in step 5.
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+
+        // What happens to the contents on entry and exit. On a tile-based GPU
+        // these are not bookkeeping: CLEAR lets the driver skip reading the
+        // tile in from main memory at all, and DONT_CARE on store would let it
+        // skip writing back. That bandwidth saving is most of why Apple
+        // Silicon is fast. STORE is required here only because we want to
+        // look at the result afterwards.
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        // No stencil buffer in play.
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+        // Images have a LAYOUT: the same pixels are arranged differently in
+        // memory depending on whether they are being rendered into, sampled,
+        // presented or copied. Other APIs perform these transitions
+        // invisibly; Vulkan makes them fields you fill in.
+        //
+        // UNDEFINED says the previous contents do not matter -- safe only
+        // because loadOp clears, and it lets the driver discard them rather
+        // than preserve them. PRESENT_SRC_KHR is where the image has to end
+        // up, since the swapchain displays it next.
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        VkAttachmentReference colorAttachmentRef{};
+
+        // An index into pAttachments below -- and the same number the fragment
+        // shader writes through with layout(location = 0) out vec4. Those two
+        // numberings are one numbering; this is where they meet.
+        colorAttachmentRef.attachment = 0;
+
+        // The layout to hold DURING the subpass. So the driver runs
+        // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL on entry and
+        // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR on exit by itself.
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+
+        // Spelled out because a subpass could bind compute instead.
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorAttachmentRef;
+
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+
+        // Step 9a returns here to add a subpass dependency, which is what
+        // stops the pass beginning before the swapchain image is available.
+
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr,
+                               &renderPass) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create render pass!");
+        }
+
+        std::cout << "Render pass created:\n"
+                  << "\tattachments: " << renderPassInfo.attachmentCount
+                  << " colour, format " << swapChainImageFormat << "\n"
+                  << "\tsubpasses:   " << renderPassInfo.subpassCount
+                  << ", graphics bind point\n"
+                  << "\tload/store:  CLEAR on entry, STORE on exit\n"
+                  << "\tlayouts:     UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL"
+                     " -> PRESENT_SRC_KHR" << std::endl;
+    }
+
     // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
     // depend on which directory the program is launched from.
     static std::vector<char> readFile(const std::string& filename) {
@@ -1060,9 +1142,10 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The layout was made after the
-        // views, so it goes before them.
+        // Reverse creation order throughout. The layout was made last, so it
+        // goes first, then the render pass that preceded it.
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        vkDestroyRenderPass(device, renderPass, nullptr);
 
         // The views go before the swapchain, since
         // they reference images it owns; the swapchain before the device that
