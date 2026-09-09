@@ -1,12 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 4b -- vulkan-tutorial.com "Shader modules":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Shader_modules
+// Phase 2, step 5 -- vulkan-tutorial.com "Fixed functions":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
 //
-// Loads the SPIR-V the build produced and wraps it in VkShaderModules. These
-// are the first objects that do NOT live until cleanup(): a module is only a
-// compilation input, so it is destroyed at the end of the function that made
-// it, once the pipeline has taken what it needs.
+// Describes every part of the pipeline that is not programmable. A VkPipeline
+// is immutable, so nearly all render state is baked in at creation and the
+// driver optimises once instead of patching shaders at draw time. Viewport
+// and scissor are the exception, left dynamic so a resize does not force a
+// pipeline rebuild. Creates one object: the VkPipelineLayout.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -153,6 +154,10 @@ private:
 
     // Ours, unlike swapChainImages: created by us, so destroyed by us.
     std::vector<VkImageView> swapChainImageViews;
+
+    // The shaders' uniform interface -- empty for now. Unlike the shader
+    // modules, this outlives pipeline creation, so it is freed in cleanup().
+    VkPipelineLayout pipelineLayout;
 
     void initWindow() {
         glfwInit();
@@ -829,8 +834,143 @@ private:
                   << " bytes SPIR-V, entry point \""
                   << shaderStages[1].pName << "\"" << std::endl;
 
-        // Step 5 (fixed functions) and 6a (render pass) fill the gap here.
-        // Step 6b consumes shaderStages in vkCreateGraphicsPipelines.
+        // ---- Fixed-function state ----
+
+        // The escape hatch from pipeline immutability: these two are left out
+        // of the baked object and supplied at record time with
+        // vkCmdSetViewport / vkCmdSetScissor. Doing it here is what makes the
+        // window resizing in step 11 survivable -- otherwise every resize
+        // would mean rebuilding the whole pipeline.
+        std::vector<VkDynamicState> dynamicStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR
+        };
+
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount =
+            static_cast<uint32_t>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        // Empty on purpose: shader.vert hardcodes its three vertices, so
+        // nothing arrives from a buffer. Phase 3's "Vertex input description"
+        // step is exactly where this stops being empty.
+        VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+        vertexInputInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInputInfo.vertexBindingDescriptionCount = 0;
+        vertexInputInfo.vertexAttributeDescriptionCount = 0;
+
+        // What the vertices form. TRIANGLE_LIST: every three vertices are one
+        // triangle, with no reuse between them.
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        // The counts stay baked in even though the values are dynamic: the
+        // pipeline must know how many viewports to expect, just not where.
+        //
+        // Viewport and scissor are easy to conflate and do different jobs. The
+        // viewport is a transformation -- it maps clip space onto framebuffer
+        // pixels, so a smaller one SCALES the image down. The scissor is a
+        // filter -- fragments outside it are discarded, so a smaller one CROPS.
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+
+        // Fragments past the near/far planes are discarded rather than
+        // clamped. Clamping is a shadow-mapping trick and needs a GPU feature.
+        rasterizer.depthClampEnable = VK_FALSE;
+
+        // VK_TRUE would stop geometry reaching the rasterizer at all, which
+        // disables output entirely.
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;
+
+        // LINE (wireframe) and POINT each need a GPU feature enabled.
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+
+        // Anything above 1.0 needs the wideLines feature.
+        rasterizer.lineWidth = 1.0f;
+
+        // Back-face culling. Worth remembering as a suspect: if step 9b shows
+        // a blank window and validation says nothing, a winding-order mismatch
+        // here is the classic cause -- the triangle gets culled in silence.
+        // Our three vertices wind clockwise in Vulkan's Y-down framebuffer
+        // space, so they survive this.
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+
+        rasterizer.depthBiasEnable = VK_FALSE;
+
+        // Off. It antialiases polygon edges by sampling a pixel several times
+        // and needs a GPU feature. The roadmap skips the Multisampling chapter
+        // outright, because a path tracer antialiases by jittering rays within
+        // the pixel -- which falls out of the sampling it already does.
+        VkPipelineMultisampleStateCreateInfo multisampling{};
+        multisampling.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = VK_FALSE;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        // Blending off, so a fragment's colour replaces what the framebuffer
+        // held. The write mask still has to name the channels to write.
+        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+        colorBlendAttachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorBlendAttachment.blendEnable = VK_FALSE;
+
+        VkPipelineColorBlendStateCreateInfo colorBlending{};
+        colorBlending.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+
+        // A bitwise combination instead of blending. Enabling it would switch
+        // off the per-attachment blending above entirely.
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+
+        // The shaders' uniform interface: which descriptor sets and push
+        // constants they can see. Empty, because these two read nothing from
+        // outside. Phase 4 is where the path tracer's BVH, primitive,
+        // material, camera and image bindings get declared right here.
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 0;
+        pipelineLayoutInfo.pushConstantRangeCount = 0;
+
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
+                                   &pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create pipeline layout!");
+        }
+
+        std::cout << "Pipeline layout created; fixed-function state described:"
+                  << "\n\tdynamic state: viewport + scissor ("
+                  << dynamicState.dynamicStateCount << " states)"
+                  << "\n\tvertex input:  "
+                  << vertexInputInfo.vertexBindingDescriptionCount
+                  << " bindings (vertices live in the shader)"
+                  << "\n\ttopology:      TRIANGLE_LIST, "
+                  << viewportState.viewportCount << " viewport"
+                  << "\n\trasterizer:    FILL, cull BACK, front face CLOCKWISE"
+                  << "\n\tmultisample:   "
+                  << multisampling.rasterizationSamples << " sample"
+                  << "\n\tblending:      off, "
+                  << colorBlending.attachmentCount << " attachment"
+                  << std::endl;
+
+        // Step 6a adds the render pass here; 6b then feeds all of the above,
+        // plus shaderStages, into vkCreateGraphicsPipelines.
 
         // Destroyed here, not in cleanup(). A shader module is only an input
         // to pipeline creation; once the pipeline exists it holds the compiled
@@ -920,7 +1060,11 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order. The views go before the swapchain, since
+        // Reverse creation order throughout. The layout was made after the
+        // views, so it goes before them.
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
+        // The views go before the swapchain, since
         // they reference images it owns; the swapchain before the device that
         // made it; the messenger next; the instance outlives everything made
         // through it. The swapchain's VkImages need no calls of their own --
