@@ -1,188 +1,130 @@
-# CPU Multithreaded Ray Tracing Engine (C++)
+# Ray Tracing Engine — Vulkan (GPU)
 
-A CPU-based, multithreaded ray tracing system designed as a foundational rendering engine
-for exploring physically based light transport, acceleration structures, volumetric
-light transport, and parallel execution on modern multi-core processors. The current
-implementation emphasizes correctness, architectural clarity, and a framebuffer-first,
-tile-based rendering pipeline, serving as a base for future extensions into
-hardware-accelerated and backend-specific rendering pipelines.
+A GPU implementation of a physically based path tracer, built on Vulkan compute.
 
----
+This is the GPU half of a two-part project. The CPU engine is a complete,
+importance-sampled path tracer with deterministic output; this repository takes that
+renderer onto the GPU, where thousands of pixels are traced concurrently rather than
+a handful of tiles across CPU threads.
 
-## System Overview
-
-This renderer initially used a scanline-based, single-threaded execution model,
-writing pixel results directly to the output stream. While suitable for early
-correctness validation, this approach limited scalability and made performance
-analysis and backend extensibility difficult.
-
-**The current architecture adopts a framebuffer-first rendering pipeline with tile-based
-work decomposition. The image is divided into fixed-size tiles, which are dynamically
-scheduled across a pool of CPU worker threads using atomic work distribution. Each tile
-is rendered independently into a shared framebuffer, followed by a final output pass.**
-
-**This structural shift improves CPU utilization, enables deterministic and progressive
-rendering strategies, simplifies profiling and instrumentation, and establishes a clean
-execution model that can be extended toward alternative backends such as GPU-accelerated
-or hardware-specific rendering pipelines.**
+> **Companion project** — the CPU engine lives at
+> [raytracing-engine-cpu](https://github.com/saishmalunde8/raytracing-engine-cpu).
+> That repository is canonical for all renderer code; this one carries a snapshot of
+> it as a reference implementation.
 
 ---
 
-## Determinism
+## Current Status
 
-The renderer supports a deterministic execution mode in which identical inputs produce bitwise-identical output, independent of thread count or scheduling order, enabling debugging, benchmarking, and GPU parity.
+**Vulkan foundation — complete.** Instance creation with portability flags, validation
+layers in debug builds, physical device selection and queue family lookup, logical
+device with graphics and compute queues, window surface, swapchain with format and
+present-mode selection, image views, SPIR-V shader modules, fixed-function pipeline
+state, render pass, framebuffers, and a command pool with recorded draw commands.
 
-Determinism is achieved through:
-- Explicit per-pixel, per-sample RNG seeding
-- Elimination of global randomness during rendering
-- Deterministic motion blur time sampling and volumetric scattering
-- Thread-safe, order-independent accumulation
+**Renderer port — not yet started.** The path tracer has not been moved to the GPU.
+The CPU implementation under `include/` and `src/` currently runs unchanged, on the CPU.
 
----
-
-## Capabilities
-
-### Rendering
-- Recursive path tracing with configurable maximum depth
-- Monte Carlo sampling with multiple samples per pixel
-- Gamma-correct output
-- Deterministic and non-deterministic execution modes
-
-### Geometry
-- Static and moving spheres
-- Arbitrary quadrilaterals
-- Axis-aligned boxes
-- Hierarchical scene composition via hittable abstractions
-- Support for nested volumetric boundaries
-
-### Materials
-- Lambertian diffuse reflection
-- Metallic reflection with controllable roughness
-- Dielectric materials with refraction and total internal reflection
-- Emissive materials for area light sources
-
-### Textures
-- Solid color textures
-- Image-based textures (stb_image)
-- Procedural Perlin noise
-- Turbulence and marble-style procedural textures
-
-### Volumetrics
-- Constant-density participating media
-- Isotropic scattering
-- Volumetric absorption
-- Nested volumetric regions
-
-### Acceleration Structures
-- Bounding Volume Hierarchy (BVH)
-- Axis-aligned bounding boxes (AABB)
+This ordering is deliberate: the CPU renderer was brought up to date with importance
+sampling *before* any GPU sampling code was written, so the port targets the current
+algorithm rather than an obsolete one, and has a working reference to be validated
+against.
 
 ---
 
-## Example Renders
+## Why Two Backends
 
-The following renders are selected to validate correctness across core rendering
-features and scene complexity, rather than visual styling.
+The two implementations attack different limits.
 
----
+Multithreading makes the renderer do the same work faster, and is bounded by core
+count — roughly 3× on four cores. Importance sampling makes it do *less* work for the
+same image, which on the CPU engine reached equal quality about 39× faster with no
+new hardware. A GPU backend attacks the first limit again, far harder: thousands of
+concurrent invocations instead of four.
 
-### 1. Core Ray Tracing, Motion Blur & Texturing
-
-![Final Scene – Motion & Textures](docs/images/Final_Scene_1.png)
-
-Validation of recursive path tracing with diffuse, metallic, and dielectric materials,
-including textured geometry and motion blur via time-varying primitives. The scene
-demonstrates correct handling of moving objects, texture mapping, and stochastic
-sampling.
+Those gains multiply. The GPU port inherits an algorithm that already needs a fraction
+of the samples, so the two improvements compound rather than compete.
 
 ---
 
-### 2. Global Illumination & Area Lighting
+## CPU Reference Implementation
 
-![Cornell Box](docs/images/Cornell_Box.png)
+`include/raytracer/`, `src/main.cpp` and `tools/` hold a snapshot of the CPU engine.
+It exists here as a **correctness oracle**: render a scene on both backends and compare.
 
-Cornell box scene illustrating indirect illumination, soft shadows, and color
-bleeding from an emissive area light source, validating global illumination behavior
-and geometric correctness.
+The exact upstream commit, the sync rules, and detailed notes on which parts of the CPU
+code must not be translated literally to GPU are recorded in
+[`REFERENCE_VERSION.md`](REFERENCE_VERSION.md).
 
----
+![CPU reference render](docs/images/cpu-reference.png)
 
-### 3. Scene Complexity & Volumetric Rendering
+*Produced by the CPU reference implementation in this repository.*
 
-![Final Scene – Volumetrics](docs/images/Final_Scene_2.png)
+### What carries over cleanly
 
-Complex scene composition incorporating bounding volume hierarchies, heterogeneous
-materials, and constant-density volumetric media. This render demonstrates
-participating media, isotropic scattering, and nested volumetric regions.
+The CPU engine was written in a way that happens to suit GPU execution:
 
----
+- **Coordinate-derived RNG** — `pixel_sample_seed(i, j, sample)` derives randomness
+  purely from a pixel's own coordinates, which is exactly what a shader invocation
+  requires. A conventional per-thread sequential generator could not be ported at all.
+- **Framebuffer-first output** — the renderer writes into a buffer and emits the image
+  as a separate pass, matching how a compute shader writes to a storage image.
+- **No mutable global state in the render path** — enforced by a build-time guard.
+- **Independent, order-independent pixels** — no cross-tile dependencies.
 
-## Execution Model Comparison
+### What has to change
 
-The render below was produced using identical scene configuration, camera parameters,
-sampling settings, and maximum ray depth. The visual output is identical across execution
-models; the difference lies entirely in how work is scheduled on the CPU.
-
-<table align="center" border="2" cellpadding="10" cellspacing="0">
-  <tr>
-    <td colspan="3" align="center">
-      <img src="docs/images/Final_Scene_1.png" alt="Render Output" width="750"/>
-    </td>
-  </tr>
-
-  <tr>
-    <th align="center">Execution Model</th>
-    <th align="center">CPU Configuration</th>
-    <th align="center">Render Time</th>
-  </tr>
-
-  <tr>
-    <td align="center">Single-threaded</td>
-    <td align="center">1 core (Apple M1)</td>
-    <td align="center"><strong>565.59 s</strong></td>
-  </tr>
-
-  <tr>
-    <td align="center">Tile-based multithreaded</td>
-    <td align="center">4 cores (Apple M1)</td>
-    <td align="center"><strong>187.04 s</strong></td>
-  </tr>
-</table>
-
-This comparison isolates the impact of execution model and work decomposition on CPU
-utilization, independent of shading, sampling, or scene complexity.
+Virtual dispatch, `shared_ptr`, recursion, the BVH's pointer-linked tree, per-bounce
+heap allocation, `double` precision, and `std::mt19937` all need GPU-appropriate
+replacements. Each is covered in `REFERENCE_VERSION.md`.
 
 ---
 
 ## Build & Run
 
-### Requirements
+### Vulkan backend
+
+Requires the Vulkan SDK (with `VULKAN_SDK` set by its `setup-env.sh`) and GLFW.
 
 ```
-- C++17-compatible compiler (clang++ or g++)
-- Unix-like environment (macOS or Linux)
-```
-### Build
-```
-clang++ -std=c++17 -Iinclude src/main.cpp -o raytracer
+cmake -B build
+cmake --build build
+./build/vulkan_backend
 ```
 
-### Run
+### CPU reference renderer
+
+Built independently of the Vulkan target, so the two cannot break each other.
+
 ```
-./raytracer > output.ppm
+clang++ -std=c++17 -O2 -Iinclude src/main.cpp -o build/raytracer
+./build/raytracer > output.ppm
 ```
 
-Note: Rendering may take significant time depending on scene complexity and sampling parameters.
+### Sampler validation
+
+Checks the direction samplers and probability densities against analytically known
+results — useful for confirming a GPU sampler matches the reference before trusting a
+full render.
+
+```
+clang++ -std=c++17 -O2 -Iinclude tools/sampling_check.cpp -o build/sampling_check
+./build/sampling_check
+```
 
 ---
 
 ## Repository Structure
+
 ```
-src/ - Application entry point and implementation code
-include/ - Core rendering abstractions and interfaces
-assets/ - Runtime assets (e.g. textures)
-docs/ - Documentation and curated render outputs
-external/ - Third-party dependencies (stb_image)
+backends/vulkan/ - Vulkan application and GPU backend
+shaders/         - GLSL sources and compiled SPIR-V
+include/         - CPU reference renderer (snapshot; see REFERENCE_VERSION.md)
+src/             - CPU reference entry point and scenes
+tools/           - Example scenes and sampler validation
+assets/          - Runtime assets (e.g. textures)
+docs/            - Documentation and render outputs
+external/        - Third-party dependencies (stb_image)
 ```
 
 ---
@@ -193,13 +135,3 @@ This project draws from the concepts and techniques presented in Peter Shirley�
 *Ray Tracing in One Weekend* series. The focus of this implementation is on deeply
 engaging with the underlying rendering principles and organizing them into a
 coherent, extensible system that can serve as a base for further exploration.
-
----
-
-## Roadmap
-
-Planned areas of exploration include:
-- Progressive rendering
-- Performance profiling and optimization
-- Tile scheduling strategies and cache behavior analysis
-- Exploration of hardware-accelerated and GPU-based backends
