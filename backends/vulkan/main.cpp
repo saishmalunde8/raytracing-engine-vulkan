@@ -1,12 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 7 -- vulkan-tutorial.com "Framebuffers":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Framebuffers
+// Phase 2, step 8 -- vulkan-tutorial.com "Command buffers":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Command_buffers
 //
-// Binds the render pass's schema to real images. The render pass said "one
-// colour attachment, this format, cleared then presented" without ever naming
-// an image; a framebuffer supplies the image views that fill those slots. One
-// per swapchain image, because the swapchain decides which image you get.
+// You never call the GPU directly in Vulkan: you record a list of commands
+// into a buffer and submit the list. That is what makes recording
+// parallelisable across threads and moves driver setup cost off the draw
+// call. The same machinery records vkCmdDispatch for compute in Phase 5.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -166,6 +166,11 @@ private:
     // free at draw time, so every one of them needs a framebuffer waiting.
     std::vector<VkFramebuffer> swapChainFramebuffers;
 
+    VkCommandPool commandPool;
+
+    // Freed with the pool, so it never appears in cleanup() by itself.
+    VkCommandBuffer commandBuffer;
+
     void initWindow() {
         glfwInit();
 
@@ -192,6 +197,18 @@ private:
         createRenderPass();
         createGraphicsPipeline();
         createFramebuffers();
+        createCommandPool();
+        createCommandBuffer();
+
+        // Temporary, for this step's checkpoint: recording is validated as it
+        // happens, so actually running it is what proves the commands are
+        // well-formed. Step 9b moves this into drawFrame(), where the image
+        // index comes from vkAcquireNextImageKHR instead of being hardcoded.
+        recordCommandBuffer(commandBuffer, 0);
+        std::cout << "Command buffer recorded against framebuffer 0: clear, "
+                     "bind pipeline, set viewport + scissor, draw 3 vertices."
+                     "\n\tNothing submitted to the GPU yet."
+                  << std::endl;
     }
 
     void createInstance() {
@@ -879,6 +896,117 @@ private:
                   << swapChainExtent.height << std::endl;
     }
 
+    void createCommandPool() {
+        QueueFamilyIndices queueFamilyIndices =
+            findQueueFamilies(physicalDevice);
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+
+        // Lets one buffer be reset and re-recorded on its own; without it the
+        // whole pool has to be reset at once. We re-record every frame.
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+
+        // A pool belongs to exactly one queue family, because its commands are
+        // encoded for that family's capabilities -- a buffer from a graphics
+        // pool cannot be submitted to a transfer-only queue.
+        //
+        // The reason pools exist as a separate object at all is that they are
+        // NOT thread-safe: two threads cannot record from one pool at the same
+        // time. One pool per thread is the pattern that makes parallel command
+        // recording possible.
+        poolInfo.queueFamilyIndex =
+            queueFamilyIndices.graphicsAndComputeFamily.value();
+
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create command pool!");
+        }
+
+        std::cout << "Command pool created on queue family "
+                  << poolInfo.queueFamilyIndex << std::endl;
+    }
+
+    void createCommandBuffer() {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+
+        // PRIMARY: submittable to a queue, but cannot be called from another
+        // command buffer. SECONDARY is the exact inverse, and is the
+        // multithreading tool -- record chunks in parallel as secondary, then
+        // have a single primary execute them.
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate command buffers!");
+        }
+    }
+
+    void recordCommandBuffer(VkCommandBuffer commandBuffer,
+                             uint32_t imageIndex) {
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+        if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to begin recording command buffer!");
+        }
+
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = renderPass;
+
+        // Which of the three framebuffers to draw into. In step 9b this index
+        // arrives from vkAcquireNextImageKHR rather than being passed in.
+        renderPassInfo.framebuffer = swapChainFramebuffers[imageIndex];
+
+        renderPassInfo.renderArea.offset = {0, 0};
+        renderPassInfo.renderArea.extent = swapChainExtent;
+
+        // The colour that loadOp = CLEAR in step 6a actually clears to.
+        VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearColor;
+
+        // INLINE says the commands live in this primary buffer. The
+        // alternative says they live in secondary buffers this one executes.
+        vkCmdBeginRenderPass(commandBuffer, &renderPassInfo,
+                             VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          graphicsPipeline);
+
+        // Obligatory rather than optional: step 5 declared these dynamic, so
+        // the pipeline does not carry them and a draw without them is
+        // undefined. Resize-without-rebuild was the benefit; this is the bill.
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(swapChainExtent.width);
+        viewport.height = static_cast<float>(swapChainExtent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.offset = {0, 0};
+        scissor.extent = swapChainExtent;
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+        // 3 vertices, 1 instance, starting from vertex 0 and instance 0. That
+        // firstVertex is where gl_VertexIndex begins counting in shader.vert.
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(commandBuffer);
+
+        if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to record command buffer!");
+        }
+    }
+
     // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
     // depend on which directory the program is launched from.
     static std::vector<char> readFile(const std::string& filename) {
@@ -1246,7 +1374,13 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The framebuffers reference both
+        // Reverse creation order throughout. The pool goes first, which also
+        // happens to be the safer direction: freeing it frees the command
+        // buffers, so nothing recorded still refers to a framebuffer or
+        // pipeline destroyed below. Command buffers need no call of their own.
+        vkDestroyCommandPool(device, commandPool, nullptr);
+
+        // The framebuffers reference both
         // the render pass and the image views, so they have to go before
         // either -- which is also where reverse order puts them.
         for (auto framebuffer : swapChainFramebuffers) {
