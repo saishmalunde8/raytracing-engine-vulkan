@@ -13,6 +13,7 @@ class quad : public hittable {
         normal = unit_vector(n);
         D = dot(normal, Q);
         w = n / dot(n,n);
+        area = n.length();
 
         set_bounding_box();
     }
@@ -69,6 +70,27 @@ class quad : public hittable {
             return true;
         }
 
+    // Sampling a quad means picking a point uniformly on its surface, which is
+    // uniform in area rather than in direction. Converting an area density into
+    // a direction density brings in the two standard geometric factors: it falls
+    // off with distance squared, and shrinks as the quad turns edge-on, because
+    // a tilted quad covers less of the sky from where the ray started.
+    double pdf_value(const point3& origin, const vec3& direction) const override {
+        hit_record rec;
+        if (!this->hit(ray(origin, direction), interval(0.001, infinity), rec))
+            return 0;
+
+        auto distance_squared = rec.t * rec.t * direction.length_squared();
+        auto cosine = std::fabs(dot(direction, normal) / direction.length());
+
+        return distance_squared / (cosine * area);
+    }
+
+    vec3 random(const point3& origin, RNG& rng) const override {
+        auto p = Q + (rng.next_double() * u) + (rng.next_double() * v);
+        return p - origin;
+    }
+
   private:
     point3 Q;
     vec3 u, v;
@@ -77,6 +99,7 @@ class quad : public hittable {
     aabb bbox;
     vec3 normal;
     double D;
+    double area;
 };
 
 inline shared_ptr<hittable_list> box(const point3& a, const point3& b, shared_ptr<material> mat)

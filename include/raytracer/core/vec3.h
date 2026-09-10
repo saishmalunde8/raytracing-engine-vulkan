@@ -110,28 +110,11 @@ inline vec3 unit_vector(const vec3& v) {
     return v / v.length();
 }
 
-inline vec3 random_in_unit_disk() {
-    while (true) {
-        auto p = vec3(random_double(-1,1), random_double(-1,1), 0);
-        if (p.length_squared() < 1)
-            return p;
-    }
-}
-
-inline vec3 random_unit_vector() {
-    auto a = random_double() * 2 * 3.1415926535897932385;
-    auto z = random_double() * 2.0 - 1.0;
-    auto r = std::sqrt(1 - z*z);
-    return vec3(r*std::cos(a), r*std::sin(a), z);
-    }
-    
-inline vec3 random_on_hemisphere(const vec3& normal) {
-    vec3 on_unit_sphere = random_unit_vector();
-    if (dot(on_unit_sphere, normal) > 0.0) // In the same hemisphere as the normal
-        return on_unit_sphere;
-    else
-        return -on_unit_sphere;
-}
+// Direction sampling lives on RNG (see core/rng.h) rather than as free
+// functions here. Sampling during a render must draw from the RNG that was
+// passed in, so there is deliberately no ambient-randomness version to call by
+// mistake. vec3::random() above is retained for scene construction, which runs
+// once on the main thread before any rendering begins.
 
 inline vec3 reflect(const vec3& v, const vec3& n) {
     return v - 2*dot(v,n)*n;

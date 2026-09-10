@@ -6,6 +6,8 @@
 #define CAMERA_H
 
 #include "raytracer/geometry/hittable.h"
+#include "raytracer/geometry/hittable_list.h"
+#include "raytracer/sampling/pdf.h"
 #include "raytracer/materials/material.h"
 #include "raytracer/renderer/color.h"
 #include "raytracer/core/rtweekend.h"
@@ -23,6 +25,16 @@ class camera {
         double g_sky_strength     = 1.0; // 0 = background only, 1 = full sky
         bool deterministic = false;
 
+        // Upper bound on worker threads. The renderer still never asks for more
+        // than the hardware reports, so this only ever caps that number. The
+        // default matches what the renderer has always used.
+        //
+        // Deterministic renders are unaffected by this: seeding is per pixel and
+        // per sample, so the same scene produces the same image at any thread
+        // count. Adjustable so that property can actually be checked, and so the
+        // single-threaded benchmark figure can be reproduced.
+        unsigned int max_threads = 4;
+
         double vfov     = 90;  // Vertical view angle (field of view)
         point3 lookfrom = point3(0,0,0);   // Point camera is looking from
         point3 lookat   = point3(0,0,-1);  // Point camera is looking at
@@ -38,7 +50,10 @@ class camera {
             int y1;
         };
 
-        void render(const hittable& world) {
+        // `lights` holds the shapes worth aiming rays at. Like `world` it is
+        // read-only for the whole render, so worker threads share it without
+        // synchronisation. An empty list is valid and means "no lights to aim at".
+        void render(const hittable& world, const hittable_list& lights) {
             initialize();
     // ------------------------------------------------------------------------------------                  create framebuffer
             // 1. Create framebuffer (width × height pixels)
@@ -79,6 +94,7 @@ class camera {
                         tile.x0, tile.x1,
                         tile.y0, tile.y1,
                         world,
+                        lights,
                         framebuffer
                     );
                 }
@@ -87,7 +103,7 @@ class camera {
             unsigned int hw_threads = std::thread::hardware_concurrency();
             if (hw_threads == 0) hw_threads = 4;
 
-            unsigned int thread_count = std::min(hw_threads, 4u);
+            unsigned int thread_count = std::min(hw_threads, max_threads);
     // ------------------------------------------------------------------------------------                 start render clock
             auto render_start = std::chrono::high_resolution_clock::now();
     // ------------------------------------------------------------------------------------                 create threads array and run threads
@@ -163,28 +179,34 @@ class camera {
             int x0, int x1,
             int y0, int y1,
             const hittable& world,
+            const hittable_list& lights,
             std::vector<color>& framebuffer) {
             for (int j = y0; j < y1; j++) {
                 for (int i = x0; i < x1; i++) {
                     color pixel_color(0,0,0);
                     for (int sample = 0; sample < samples_per_pixel; sample++) {
-                        ray r;
                         if (deterministic) {
-                            uint32_t seed = pixel_sample_seed(i, j, sample);
-                            RNG rng(seed);
-                            r = get_ray(i, j, rng);
-                            pixel_color += ray_color(r, max_depth, world, rng);
+                            // Seeded per pixel and per sample, so the result does not
+                            // depend on tile order, scheduling, or thread count.
+                            RNG rng(pixel_sample_seed(i, j, sample));
+                            pixel_color += sample_pixel(i, j, world, lights, rng);
                         } else {
-                            r = get_ray(i, j);
-                            pixel_color += ray_color(r, max_depth, world);
+                            pixel_color += sample_pixel(i, j, world, lights, thread_rng());
                         }
-                        
                     }
 
                     int index = j * image_width + i;
                     framebuffer[index] = pixel_samples_scale * pixel_color;
                 }
             }
+        }
+
+        // The entire per-sample path. Both seeding strategies run through this,
+        // so there is only one implementation of a sample to keep correct.
+        color sample_pixel(int i, int j, const hittable& world, const hittable_list& lights,
+                           RNG& rng) const {
+            ray r = get_ray(i, j, rng);
+            return ray_color(r, max_depth, world, lights, rng);
         }
 
         void initialize() {
@@ -224,24 +246,12 @@ class camera {
             defocus_disk_v = v * defocus_radius;
         }
     
-        ray get_ray(int i, int j) const {
-            // Construct a camera ray originating from the defocus disk and directed at a randomly
-            // sampled point around the pixel location i, j.
-    
-            auto offset = sample_square();
-            auto pixel_sample = pixel00_loc
-                              + ((i + offset.x()) * pixel_delta_u)
-                              + ((j + offset.y()) * pixel_delta_v);
-    
-            auto ray_origin = (defocus_angle <= 0) ? center : defocus_disk_sample();
-            auto ray_direction = pixel_sample - ray_origin;
-            auto ray_time = random_double();
-
-            return ray(ray_origin, ray_direction, ray_time);
-        }
-// ------------------------------------------------------------------------------------
+        // Construct a camera ray originating from the defocus disk and directed at a
+        // randomly sampled point around the pixel location i, j. The three draws
+        // below happen in a fixed order -- pixel offset, then defocus disk, then
+        // shutter time -- because that order defines the random stream a
+        // deterministic render reproduces.
         ray get_ray(int i, int j, RNG& rng) const {
-            // Deterministic version using provided RNG
 
             auto offset = sample_square(rng);
 
@@ -249,88 +259,34 @@ class camera {
                             + ((i + offset.x()) * pixel_delta_u)
                             + ((j + offset.y()) * pixel_delta_v);
 
-            point3 ray_origin;
-            if (defocus_angle <= 0) {
-                ray_origin = center;
-            } else {
-                // Deterministic defocus disk sample
-                auto r = std::sqrt(rng.next_double());
-                auto theta = 2 * pi * rng.next_double();
-                auto x = r * std::cos(theta);
-                auto y = r * std::sin(theta);
-                ray_origin = center + x * defocus_disk_u + y * defocus_disk_v;
-            }
+            auto ray_origin = (defocus_angle <= 0) ? center : defocus_disk_sample(rng);
 
             auto ray_direction = pixel_sample - ray_origin;
             auto ray_time = rng.next_double();
 
             return ray(ray_origin, ray_direction, ray_time);
         }
-// ------------------------------------------------------------------------------------
-
-        vec3 sample_square() const {
-            // Returns the vector to a random point in the [-.5,-.5]-[+.5,+.5] unit square.
-            return vec3(random_double() - 0.5, random_double() - 0.5, 0);
-        }
 
         vec3 sample_square(RNG& rng) const {
+            // Returns the vector to a random point in the [-.5,-.5]-[+.5,+.5] unit square.
             return vec3(rng.next_double() - 0.5,
                         rng.next_double() - 0.5,
                         0);
         }
 
-        point3 defocus_disk_sample() const {
-            // Returns a random point in the camera defocus disk.
-            auto p = random_in_unit_disk();
-            return center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
+        // Returns a random point in the camera defocus disk, sampled in polar form
+        // so it consumes exactly two draws. A rejection-sampled disk would consume a
+        // variable number and desynchronise the stream.
+        point3 defocus_disk_sample(RNG& rng) const {
+            auto r = std::sqrt(rng.next_double());
+            auto theta = 2 * pi * rng.next_double();
+            auto x = r * std::cos(theta);
+            auto y = r * std::sin(theta);
+            return center + x * defocus_disk_u + y * defocus_disk_v;
         }
 
-        color ray_color(const ray& r, int depth, const hittable& world) const {
-            // If we've exceeded the ray bounce limit, no more light is gathered.
-            if (depth <= 0)
-                return color(0,0,0);
-
-            hit_record rec;
-
-            if (world.hit(r, interval(0.001, infinity), rec)) {
-
-            ray scattered;
-            color attenuation;
-
-            color color_from_emission =
-                rec.mat->emitted(rec.u, rec.v, rec.p);
-
-            if (!rec.mat->scatter(r, rec, attenuation, scattered))
-                return color_from_emission;
-
-            return color_from_emission
-                + attenuation * ray_color(scattered, depth - 1, world);
-            }
-
-        // ---------- MISS (background + gradient sky) ----------
-
-            color base_bg = background;
-
-            if (!g_use_sky_gradient)
-                return base_bg;
-
-            vec3 unit_direction = unit_vector(r.direction());
-            double t = interval(0.0, 1.0).clamp(0.35 * (unit_direction.y() + 1.0));
-
-            // Evening gradient
-            color horizon = color(1.00, 0.68, 0.45);
-            color zenith  = color(0.45, 0.55, 0.75);
-
-            color sky = (1.0 - t) * horizon + t * zenith;
-
-            // Blend sky with background (adjust strength if needed)
-            double sky_strength = 1.0;
-
-            return (1.0 - sky_strength) * base_bg
-                + sky_strength * sky;
-        }
-
-        color ray_color(const ray& r, int depth, const hittable& world, RNG& rng) const {
+        color ray_color(const ray& r, int depth, const hittable& world,
+                        const hittable_list& lights, RNG& rng) const {
             if (depth <= 0)
                 return color(0,0,0);
 
@@ -338,17 +294,75 @@ class camera {
             
             if (world.hit(r, interval(0.001, infinity), rec)) {
 
-                ray scattered;
-                color attenuation;
+                scatter_record srec;
 
                 color color_from_emission =
-                    rec.mat->emitted(rec.u, rec.v, rec.p);
+                    rec.mat->emitted(r, rec, rec.u, rec.v, rec.p);
 
-                if (!rec.mat->scatter(r, rec, attenuation, scattered, rng))
+                if (!rec.mat->scatter(r, rec, srec, rng))
                     return color_from_emission;
 
-                return color_from_emission
-                    + attenuation * ray_color(scattered, depth - 1, world, rng);
+                // Specular. The outgoing direction is determined, not chosen, so
+                // there is no density to weight against -- follow it directly.
+                if (srec.skip_pdf)
+                    return color_from_emission
+                        + srec.attenuation
+                            * ray_color(srec.skip_pdf_ray, depth - 1, world, lights, rng);
+
+                // Everything else: pick a direction, then correct for having
+                // picked it that way. The weight is how much the material
+                // scatters this way, over how likely we were to choose it.
+                //
+                // With lights in the scene, half of all directions are aimed
+                // straight at one rather than left to the material's own
+                // preference -- which is how a surface finds a small bright light
+                // instead of waiting to stumble into it. Both halves are scored
+                // against the average of the two densities, and that averaging is
+                // what stops the aiming from biasing the result.
+                shared_ptr<pdf> sampling_pdf;
+
+                if (lights.objects.empty()) {
+                    // Nothing to aim at. Mixing with an unsampleable list would
+                    // send half of all rays off in a fixed placeholder direction.
+                    sampling_pdf = srec.pdf_ptr;
+                } else {
+                    sampling_pdf = make_shared<mixture_pdf>(
+                        make_shared<hittable_pdf>(lights, rec.p),
+                        srec.pdf_ptr);
+                }
+
+                ray scattered = ray(rec.p, sampling_pdf->generate(rng), r.time());
+                auto pdf_value = sampling_pdf->value(scattered.direction());
+
+                double scattering_pdf = rec.mat->scattering_pdf(r, rec, scattered);
+
+                // Two directions carry no energy and must not reach the division
+                // below.
+                //
+                // scattering_pdf <= 0 means the material does not scatter this
+                // way at all -- an aimed ray pointing at a light that sits behind
+                // the surface, most often. Its contribution is genuinely zero.
+                //
+                // A vanishing pdf_value means the sampler could not meaningfully
+                // have produced this direction, usually a hit test failing at a
+                // grazing angle. Dividing by it turns one sample into an enormous
+                // weight, and that pixel stays blown out no matter how many more
+                // samples are thrown at it.
+                //
+                // Together these are also the 0/0 case, which yields NaN. The
+                // second test is written as a negated `>` so a NaN pdf, which
+                // compares false against everything, falls through it too.
+                //
+                // Returning here also skips the recursive trace, so a ray that
+                // could not have contributed costs nothing to reject.
+                if (scattering_pdf <= 0 || !(pdf_value > 1e-8))
+                    return color_from_emission;
+
+                color sample_color = ray_color(scattered, depth - 1, world, lights, rng);
+                color color_from_scatter =
+                    (srec.attenuation * scattering_pdf * sample_color) / pdf_value;
+
+                return color_from_emission + color_from_scatter;
             }
 
             // ---------- MISS (background + gradient sky) ----------
@@ -366,7 +380,11 @@ class camera {
 
             color sky = (1.0 - t) * horizon + t * zenith;
 
-            return sky;
+            // Blend the gradient over the flat background rather than replacing
+            // it, so g_sky_strength can dial the sky from "background only" to
+            // "full dusk" -- a night sky wants a hint of horizon glow, not the
+            // whole gradient at full strength.
+            return (1.0 - g_sky_strength) * base_bg + g_sky_strength * sky;
         }
 
 // --------------------------
