@@ -3,6 +3,7 @@
 
 #include "raytracer/core/interval.h"
 #include "raytracer/core/ray.h"
+#include "raytracer/core/rng.h"
 #include "raytracer/acceleration/aabb.h"
 
 class material;
@@ -33,6 +34,27 @@ class hittable {
     virtual bool hit(const ray& r, interval ray_t, hit_record& rec) const = 0;
 
     virtual aabb bounding_box() const = 0;
+
+    // Sampling support, for shapes that can usefully be aimed at -- lights,
+    // in practice. Two questions, mirroring the pdf interface:
+    //
+    //   pdf_value()  how likely was this shape to be hit by a ray leaving
+    //                `origin` in `direction`?
+    //   random()     give me a direction from `origin` towards this shape.
+    //
+    // The defaults say "I cannot be sampled": zero likelihood, and a direction
+    // that is never used because the zero likelihood excludes it. They exist so
+    // that translate, rotate_y, bvh_node and constant_medium keep compiling
+    // without change. The trade is a standing rule -- a wrapped or accelerated
+    // object must not go in a light list, because it will report zero and
+    // contribute no light at all.
+    virtual double pdf_value(const point3& origin, const vec3& direction) const {
+        return 0.0;
+    }
+
+    virtual vec3 random(const point3& origin, RNG& rng) const {
+        return vec3(1, 0, 0);
+    }
 };
 
 class translate : public hittable {

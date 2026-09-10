@@ -20,6 +20,13 @@ void write_color(std::ostream& out, const color& pixel_color) {
     auto g = pixel_color.y();
     auto b = pixel_color.z();
 
+    // A NaN survives averaging -- one bad sample poisons the whole pixel, and in
+    // a framebuffer it is far harder to trace back than a visible artefact would
+    // be. Catch it at the write boundary. `x != x` is only true for NaN.
+    if (r != r) r = 0.0;
+    if (g != g) g = 0.0;
+    if (b != b) b = 0.0;
+
     r = linear_to_gamma(r);
     g = linear_to_gamma(g);
     b = linear_to_gamma(b);
