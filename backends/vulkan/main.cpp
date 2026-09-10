@@ -1,13 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 6a -- vulkan-tutorial.com "Render passes":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
+// Phase 2, step 6b -- vulkan-tutorial.com "Conclusion":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Conclusion
 //
-// Declares what is drawn into and what happens to it at the boundaries: which
-// attachments exist, whether their contents are cleared or preserved on entry
-// and kept or discarded on exit, and which memory layouts they move between.
-// Declaring this up front is what lets a tile-based GPU -- an M1 -- skip
-// reading and writing tiles it does not need.
+// Assembles the shader stages, the fixed-function state and the render pass
+// into one VkPipeline. Until this call those were inert structs; here the
+// driver checks them against each other, which is why most pipeline mistakes
+// surface at exactly this point.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -160,6 +159,8 @@ private:
     // The shaders' uniform interface -- empty for now. Unlike the shader
     // modules, this outlives pipeline creation, so it is freed in cleanup().
     VkPipelineLayout pipelineLayout;
+
+    VkPipeline graphicsPipeline;
 
     void initWindow() {
         glfwInit();
@@ -1051,8 +1052,64 @@ private:
                   << colorBlending.attachmentCount << " attachment"
                   << std::endl;
 
-        // Step 6a adds the render pass here; 6b then feeds all of the above,
-        // plus shaderStages, into vkCreateGraphicsPipelines.
+        // ---- The pipeline object itself ----
+
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = shaderStages;
+
+        pipelineInfo.pVertexInputState = &vertexInputInfo;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+
+        // Null because there is no depth or stencil buffer. The roadmap skips
+        // the Depth buffering chapter outright: a path tracer resolves depth
+        // by ray distance, so a z-buffer has nothing to contribute.
+        pipelineInfo.pDepthStencilState = nullptr;
+
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDynamicState = &dynamicState;
+
+        // A handle, not a pointer: the layout is a real object, unlike the
+        // state structs above which are consumed and forgotten.
+        pipelineInfo.layout = pipelineLayout;
+
+        // The render pass is a COMPATIBILITY reference, not an exclusive tie.
+        // This pipeline works with any render pass compatible with this one,
+        // where compatibility means matching attachment formats and sample
+        // counts rather than being the same object. That, together with
+        // viewport and scissor being dynamic from step 5, is what lets step
+        // 11a rebuild the swapchain on a resize without rebuilding this.
+        pipelineInfo.renderPass = renderPass;
+        pipelineInfo.subpass = 0;
+
+        // Pipeline derivatives: a new pipeline sharing most of its state with
+        // an existing one can be cheaper to create. Unused, and it would need
+        // VK_PIPELINE_CREATE_DERIVATIVE_BIT in flags to have any effect.
+        pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+        pipelineInfo.basePipelineIndex = -1;
+
+        // Plural, and it takes an array, because real engines create many
+        // pipelines at once. The VK_NULL_HANDLE is a VkPipelineCache slot -- a
+        // blob the driver can serialise to disk and reload, so shader
+        // compilation is paid once ever instead of at every launch. That is
+        // the actual fix for the compilation stutter games are known for.
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                      nullptr, &graphicsPipeline) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create graphics pipeline!");
+        }
+
+        std::cout << "Graphics pipeline created:"
+                  << "\n\tstages:      " << pipelineInfo.stageCount
+                  << "\n\tsubpass:     " << pipelineInfo.subpass
+                  << " of the render pass above"
+                  << "\n\tdepth test:  none (a path tracer uses ray distance)"
+                  << "\n\tcache:       none (compiled fresh this launch)"
+                  << std::endl;
 
         // Destroyed here, not in cleanup(). A shader module is only an input
         // to pipeline creation; once the pipeline exists it holds the compiled
@@ -1142,8 +1199,9 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The layout was made last, so it
-        // goes first, then the render pass that preceded it.
+        // Reverse creation order throughout. The pipeline was made last, so
+        // it goes first, then the layout it used, then the render pass.
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
 
