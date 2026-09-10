@@ -1,12 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 6b -- vulkan-tutorial.com "Conclusion":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Conclusion
+// Phase 2, step 7 -- vulkan-tutorial.com "Framebuffers":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Framebuffers
 //
-// Assembles the shader stages, the fixed-function state and the render pass
-// into one VkPipeline. Until this call those were inert structs; here the
-// driver checks them against each other, which is why most pipeline mistakes
-// surface at exactly this point.
+// Binds the render pass's schema to real images. The render pass said "one
+// colour attachment, this format, cleared then presented" without ever naming
+// an image; a framebuffer supplies the image views that fill those slots. One
+// per swapchain image, because the swapchain decides which image you get.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -162,6 +162,10 @@ private:
 
     VkPipeline graphicsPipeline;
 
+    // One per swapchain image: vkAcquireNextImageKHR decides which image is
+    // free at draw time, so every one of them needs a framebuffer waiting.
+    std::vector<VkFramebuffer> swapChainFramebuffers;
+
     void initWindow() {
         glfwInit();
 
@@ -187,6 +191,7 @@ private:
         createImageViews();
         createRenderPass();
         createGraphicsPipeline();
+        createFramebuffers();
     }
 
     void createInstance() {
@@ -832,6 +837,48 @@ private:
                      " -> PRESENT_SRC_KHR" << std::endl;
     }
 
+    void createFramebuffers() {
+        swapChainFramebuffers.resize(swapChainImageViews.size());
+
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            VkImageView attachments[] = {
+                swapChainImageViews[i]
+            };
+
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+
+            // A compatibility reference, exactly as in the pipeline: any
+            // render pass with matching attachment formats and counts works.
+            framebufferInfo.renderPass = renderPass;
+
+            // Positional, and this is where a chain built over four steps
+            // finally lands on an image: the fragment shader's
+            // layout(location = 0) out, the subpass's
+            // VkAttachmentReference.attachment = 0, the render pass's
+            // pAttachments[0], and attachments[0] here are one numbering.
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;
+
+            framebufferInfo.width = swapChainExtent.width;
+            framebufferInfo.height = swapChainExtent.height;
+
+            // The third place this number has to agree: the swapchain's
+            // imageArrayLayers in 2c, the views' layerCount in 3, and here.
+            framebufferInfo.layers = 1;
+
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr,
+                                    &swapChainFramebuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create framebuffer!");
+            }
+        }
+
+        std::cout << "Framebuffers created: " << swapChainFramebuffers.size()
+                  << " for " << swapChainImageViews.size()
+                  << " image view(s), at " << swapChainExtent.width << "x"
+                  << swapChainExtent.height << std::endl;
+    }
+
     // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
     // depend on which directory the program is launched from.
     static std::vector<char> readFile(const std::string& filename) {
@@ -1199,8 +1246,14 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The pipeline was made last, so
-        // it goes first, then the layout it used, then the render pass.
+        // Reverse creation order throughout. The framebuffers reference both
+        // the render pass and the image views, so they have to go before
+        // either -- which is also where reverse order puts them.
+        for (auto framebuffer : swapChainFramebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+
+        // Then the pipeline, the layout it used, and the render pass.
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
