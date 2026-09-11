@@ -1,12 +1,12 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 8 -- vulkan-tutorial.com "Command buffers":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Command_buffers
+// Phase 2, step 9a -- vulkan-tutorial.com "Rendering and presentation":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation
 //
-// You never call the GPU directly in Vulkan: you record a list of commands
-// into a buffer and submit the list. That is what makes recording
-// parallelisable across threads and moves driver setup cost off the draw
-// call. The same machinery records vkCmdDispatch for compute in Phase 5.
+// Every Vulkan call that touches the GPU is asynchronous, so acquire, draw and
+// present would run in any order unless told otherwise. Semaphores order work
+// between GPU operations without ever blocking the CPU; a fence is how the CPU
+// waits for the GPU. Nothing is submitted yet -- this only builds the tools.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -171,6 +171,13 @@ private:
     // Freed with the pool, so it never appears in cleanup() by itself.
     VkCommandBuffer commandBuffer;
 
+    // Semaphores order one GPU operation against another and never block the
+    // CPU -- their state cannot even be read from the host. A fence is the
+    // opposite tool: it is how the CPU waits for the GPU to finish.
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
+    VkFence inFlightFence;
+
     void initWindow() {
         glfwInit();
 
@@ -199,6 +206,7 @@ private:
         createFramebuffers();
         createCommandPool();
         createCommandBuffer();
+        createSyncObjects();
 
         // Temporary, for this step's checkpoint: recording is validated as it
         // happens, so actually running it is what proves the commands are
@@ -836,8 +844,30 @@ private:
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
 
-        // Step 9a returns here to add a subpass dependency, which is what
-        // stops the pass beginning before the swapchain image is available.
+        // The pass performs the UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+        // transition declared above on its own, but nothing so far says WHEN.
+        // By default it may start as soon as the command buffer begins
+        // executing, which can be before vkAcquireNextImageKHR has signalled
+        // that the image is actually ours to write. This pins the ordering.
+        VkSubpassDependency dependency{};
+
+        // EXTERNAL stands for the implicit operations before the render pass.
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+
+        // Wait on the colour attachment output stage of whatever preceded us,
+        // and make our own colour writes the thing that waits. Paired with
+        // step 9b waiting on imageAvailableSemaphore at this same stage, that
+        // is what keeps the layout transition behind the acquire.
+        dependency.srcStageMask =
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask =
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
 
         if (vkCreateRenderPass(device, &renderPassInfo, nullptr,
                                &renderPass) != VK_SUCCESS) {
@@ -1005,6 +1035,36 @@ private:
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
             throw std::runtime_error("failed to record command buffer!");
         }
+    }
+
+    void createSyncObjects() {
+        VkSemaphoreCreateInfo semaphoreInfo{};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+
+        // Created already signalled. Without this the first frame's
+        // vkWaitForFences blocks forever: nothing has been submitted yet, so
+        // nothing will ever signal it. The program hangs at startup with no
+        // error and no validation message -- pure silence.
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                              &imageAvailableSemaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                              &renderFinishedSemaphore) != VK_SUCCESS ||
+            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) !=
+                VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to create synchronization objects for a frame!");
+        }
+
+        std::cout << "Sync objects created:\n"
+                  << "\timageAvailable semaphore: acquire -> submit\n"
+                  << "\trenderFinished semaphore: submit  -> present\n"
+                  << "\tinFlight fence:           GPU -> CPU, pre-signalled"
+                  << std::endl;
     }
 
     // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
@@ -1374,7 +1434,13 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The pool goes first, which also
+        // Reverse creation order throughout. The sync objects were made last
+        // and nothing references them, so they go first.
+        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
+        vkDestroyFence(device, inFlightFence, nullptr);
+
+        // Then the pool, which also
         // happens to be the safer direction: freeing it frees the command
         // buffers, so nothing recorded still refers to a framebuffer or
         // pipeline destroyed below. Command buffers need no call of their own.
