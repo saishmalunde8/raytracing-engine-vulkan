@@ -1,12 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 9b -- vulkan-tutorial.com "Rendering and presentation":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation
+// Phase 2, step 10 -- vulkan-tutorial.com "Frames in flight":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Frames_in_flight
 //
-// Assembles a frame: wait on the fence, acquire an image, record against it,
-// submit, present. The submit waits at the colour-attachment-output stage
-// only, so earlier stages overlap with the acquire -- and that stage matches
-// the subpass dependency, which is what makes the handshake hold.
+// Lets the CPU record frame N+1 while the GPU still executes frame N, by
+// giving each in-flight frame its own command buffer, image-available
+// semaphore and fence. Frames in flight and swapchain image count are
+// independent numbers -- which is why the render-finished semaphores stay
+// per IMAGE here rather than following the rest to per-frame.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -27,6 +28,11 @@
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
+
+// Two is enough for the CPU to stay one frame ahead of the GPU and hide the
+// gap. More only adds input-to-photon latency and memory, not throughput.
+// Unrelated to the swapchain's image count, which happens to be three.
+const int MAX_FRAMES_IN_FLIGHT = 2;
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -170,14 +176,21 @@ private:
 
     VkCommandPool commandPool;
 
-    // Freed with the pool, so it never appears in cleanup() by itself.
-    VkCommandBuffer commandBuffer;
+    // One per frame in flight: the CPU cannot re-record a buffer the GPU is
+    // still reading. Freed with the pool, so never in cleanup() by itself.
+    std::vector<VkCommandBuffer> commandBuffers;
 
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
-    VkSemaphore imageAvailableSemaphore;
-    VkFence inFlightFence;
+    //
+    // Per frame in flight, which is safe because the fence for a slot
+    // guarantees the submit that waited on its semaphore has completed.
+    std::vector<VkSemaphore> imageAvailableSemaphores;
+    std::vector<VkFence> inFlightFences;
+
+    // Which in-flight slot the next frame uses. Cycles 0, 1, 0, 1...
+    uint32_t currentFrame = 0;
 
     // Deliberate deviation: the tutorial uses ONE render-finished semaphore.
     // That violates VUID-vkQueueSubmit-pSignalSemaphores-00067, and current
@@ -187,9 +200,10 @@ private:
     // engine still holds it. One per swapchain image fixes it, because image
     // i coming round again is exactly the proof its last present finished.
     //
-    // Note this is not what step 10 addresses: frames-in-flight makes
-    // semaphores per frame in flight, whereas renderFinished has to be per
-    // IMAGE. The deviation is permanent.
+    // Step 10 deliberately leaves this one alone. The tutorial converts it to
+    // MAX_FRAMES_IN_FLIGHT indexed by currentFrame there, which reintroduces
+    // exactly the violation above -- frames in flight and image count are
+    // independent numbers, and this one belongs to the image.
     std::vector<VkSemaphore> renderFinishedSemaphores;
 
     // Only so the frame rate can be reported. FIFO is vsync, so the average
@@ -225,7 +239,7 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
-        createCommandBuffer();
+        createCommandBuffers();
         createSyncObjects();
     }
 
@@ -967,7 +981,9 @@ private:
                   << poolInfo.queueFamilyIndex << std::endl;
     }
 
-    void createCommandBuffer() {
+    void createCommandBuffers() {
+        commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = commandPool;
@@ -977,10 +993,11 @@ private:
         // multithreading tool -- record chunks in parallel as secondary, then
         // have a single primary execute them.
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
+        allocInfo.commandBufferCount =
+            static_cast<uint32_t>(commandBuffers.size());
 
-        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) !=
-            VK_SUCCESS) {
+        if (vkAllocateCommandBuffers(device, &allocInfo,
+                                     commandBuffers.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate command buffers!");
         }
     }
@@ -1060,12 +1077,18 @@ private:
         // error and no validation message -- pure silence.
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
-                              &imageAvailableSemaphore) != VK_SUCCESS ||
-            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) !=
-                VK_SUCCESS) {
-            throw std::runtime_error(
-                "failed to create synchronization objects for a frame!");
+        imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                                  &imageAvailableSemaphores[i]) !=
+                    VK_SUCCESS ||
+                vkCreateFence(device, &fenceInfo, nullptr,
+                              &inFlightFences[i]) != VK_SUCCESS) {
+                throw std::runtime_error(
+                    "failed to create synchronization objects for a frame!");
+            }
         }
 
         renderFinishedSemaphores.resize(swapChainImages.size());
@@ -1079,11 +1102,17 @@ private:
         }
 
         std::cout << "Sync objects created:\n"
-                  << "\timageAvailable semaphore:  acquire -> submit\n"
-                  << "\trenderFinished semaphores: submit  -> present, "
+                  << "\timageAvailable semaphores: "
+                  << imageAvailableSemaphores.size()
+                  << " (one per frame in flight)\n"
+                  << "\trenderFinished semaphores: "
                   << renderFinishedSemaphores.size()
                   << " (one per swapchain image)\n"
-                  << "\tinFlight fence:            GPU -> CPU, pre-signalled"
+                  << "\tinFlight fences:           "
+                  << inFlightFences.size()
+                  << " (one per frame in flight), pre-signalled\n"
+                  << "\tcommand buffers:           "
+                  << commandBuffers.size() << " (one per frame in flight)"
                   << std::endl;
     }
 
@@ -1449,7 +1478,8 @@ private:
 
     void drawFrame() {
         // Wait for the previous frame's GPU work. UINT64_MAX means no timeout.
-        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE,
+                        UINT64_MAX);
 
         // Fences do NOT reset themselves. A binary semaphore is unsignalled by
         // the wait that consumes it; a fence stays signalled until told
@@ -1457,25 +1487,27 @@ private:
         // forever. Where this sits matters from step 11a on: reset only once a
         // submit is certain, or an early return leaves the fence reset with
         // nothing left to signal it.
-        vkResetFences(device, 1, &inFlightFence);
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
         // Returns an index immediately -- the image is NOT ready yet. The call
         // says which image you will get; the semaphore says when it is
         // actually yours. That gap is why imageAvailableSemaphore exists.
         uint32_t imageIndex;
         vkAcquireNextImageKHR(device, swapChain, UINT64_MAX,
-                              imageAvailableSemaphore, VK_NULL_HANDLE,
-                              &imageIndex);
+                              imageAvailableSemaphores[currentFrame],
+                              VK_NULL_HANDLE, &imageIndex);
 
         // Allowed because the pool was created with
         // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT in step 8.
-        vkResetCommandBuffer(commandBuffer, 0);
-        recordCommandBuffer(commandBuffer, imageIndex);
+        vkResetCommandBuffer(commandBuffers[currentFrame], 0);
+        recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};
+        VkSemaphore waitSemaphores[] = {
+            imageAvailableSemaphores[currentFrame]
+        };
 
         // Per-STAGE waiting, not a blanket block: the vertex shader may run
         // before the image is available, and only the colour write has to
@@ -1490,7 +1522,7 @@ private:
         submitInfo.pWaitDstStageMask = waitStages;
 
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
+        submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
 
         // Indexed by the acquired image, not by frame: see the member
         // declaration for why one shared semaphore is a spec violation.
@@ -1503,7 +1535,7 @@ private:
         // The fence is signalled when this submission completes, which is
         // exactly what the wait at the top of the next frame is waiting for.
         if (vkQueueSubmit(graphicsAndComputeQueue, 1, &submitInfo,
-                          inFlightFence) != VK_SUCCESS) {
+                          inFlightFences[currentFrame]) != VK_SUCCESS) {
             throw std::runtime_error("failed to submit draw command buffer!");
         }
 
@@ -1520,6 +1552,10 @@ private:
         presentInfo.pImageIndices = &imageIndex;
 
         vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        // Hand the next frame the other slot, so its command buffer, semaphore
+        // and fence are untouched by the work just submitted.
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 
         reportFrameTiming();
     }
@@ -1568,8 +1604,10 @@ private:
         for (auto semaphore : renderFinishedSemaphores) {
             vkDestroySemaphore(device, semaphore, nullptr);
         }
-        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
-        vkDestroyFence(device, inFlightFence, nullptr);
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+            vkDestroyFence(device, inFlightFences[i], nullptr);
+        }
 
         // Then the pool, which also
         // happens to be the safer direction: freeing it frees the command
