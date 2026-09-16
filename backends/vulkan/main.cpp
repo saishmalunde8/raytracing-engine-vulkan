@@ -1,20 +1,22 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 9a -- vulkan-tutorial.com "Rendering and presentation":
+// Phase 2, step 9b -- vulkan-tutorial.com "Rendering and presentation":
 // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Rendering_and_presentation
 //
-// Every Vulkan call that touches the GPU is asynchronous, so acquire, draw and
-// present would run in any order unless told otherwise. Semaphores order work
-// between GPU operations without ever blocking the CPU; a fence is how the CPU
-// waits for the GPU. Nothing is submitted yet -- this only builds the tools.
+// Assembles a frame: wait on the fence, acquire an image, record against it,
+// submit, present. The submit waits at the colour-attachment-output stage
+// only, so earlier stages overlap with the acquire -- and that stage matches
+// the subpass dependency, which is what makes the handshake hold.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -175,8 +177,26 @@ private:
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
     VkSemaphore imageAvailableSemaphore;
-    VkSemaphore renderFinishedSemaphore;
     VkFence inFlightFence;
+
+    // Deliberate deviation: the tutorial uses ONE render-finished semaphore.
+    // That violates VUID-vkQueueSubmit-pSignalSemaphores-00067, and current
+    // validation layers catch it. A present's wait on a binary semaphore is
+    // only known to have completed once that image is re-acquired, so reusing
+    // one semaphore across three images can signal it while the presentation
+    // engine still holds it. One per swapchain image fixes it, because image
+    // i coming round again is exactly the proof its last present finished.
+    //
+    // Note this is not what step 10 addresses: frames-in-flight makes
+    // semaphores per frame in flight, whereas renderFinished has to be per
+    // IMAGE. The deviation is permanent.
+    std::vector<VkSemaphore> renderFinishedSemaphores;
+
+    // Only so the frame rate can be reported. FIFO is vsync, so the average
+    // should settle on the display's refresh interval rather than running
+    // free -- which is the cheapest confirmation that frames really present.
+    uint32_t frameCounter = 0;
+    std::chrono::steady_clock::time_point frameWindowStart;
 
     void initWindow() {
         glfwInit();
@@ -207,16 +227,6 @@ private:
         createCommandPool();
         createCommandBuffer();
         createSyncObjects();
-
-        // Temporary, for this step's checkpoint: recording is validated as it
-        // happens, so actually running it is what proves the commands are
-        // well-formed. Step 9b moves this into drawFrame(), where the image
-        // index comes from vkAcquireNextImageKHR instead of being hardcoded.
-        recordCommandBuffer(commandBuffer, 0);
-        std::cout << "Command buffer recorded against framebuffer 0: clear, "
-                     "bind pipeline, set viewport + scissor, draw 3 vertices."
-                     "\n\tNothing submitted to the GPU yet."
-                  << std::endl;
     }
 
     void createInstance() {
@@ -1052,18 +1062,28 @@ private:
 
         if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
                               &imageAvailableSemaphore) != VK_SUCCESS ||
-            vkCreateSemaphore(device, &semaphoreInfo, nullptr,
-                              &renderFinishedSemaphore) != VK_SUCCESS ||
             vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) !=
                 VK_SUCCESS) {
             throw std::runtime_error(
                 "failed to create synchronization objects for a frame!");
         }
 
+        renderFinishedSemaphores.resize(swapChainImages.size());
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                                  &renderFinishedSemaphores[i]) !=
+                VK_SUCCESS) {
+                throw std::runtime_error(
+                    "failed to create synchronization objects for a frame!");
+            }
+        }
+
         std::cout << "Sync objects created:\n"
-                  << "\timageAvailable semaphore: acquire -> submit\n"
-                  << "\trenderFinished semaphore: submit  -> present\n"
-                  << "\tinFlight fence:           GPU -> CPU, pre-signalled"
+                  << "\timageAvailable semaphore:  acquire -> submit\n"
+                  << "\trenderFinished semaphores: submit  -> present, "
+                  << renderFinishedSemaphores.size()
+                  << " (one per swapchain image)\n"
+                  << "\tinFlight fence:            GPU -> CPU, pre-signalled"
                   << std::endl;
     }
 
@@ -1427,16 +1447,127 @@ private:
         }
     }
 
+    void drawFrame() {
+        // Wait for the previous frame's GPU work. UINT64_MAX means no timeout.
+        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+
+        // Fences do NOT reset themselves. A binary semaphore is unsignalled by
+        // the wait that consumes it; a fence stays signalled until told
+        // otherwise, so frame two would wait on an already-signalled fence
+        // forever. Where this sits matters from step 11a on: reset only once a
+        // submit is certain, or an early return leaves the fence reset with
+        // nothing left to signal it.
+        vkResetFences(device, 1, &inFlightFence);
+
+        // Returns an index immediately -- the image is NOT ready yet. The call
+        // says which image you will get; the semaphore says when it is
+        // actually yours. That gap is why imageAvailableSemaphore exists.
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX,
+                              imageAvailableSemaphore, VK_NULL_HANDLE,
+                              &imageIndex);
+
+        // Allowed because the pool was created with
+        // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT in step 8.
+        vkResetCommandBuffer(commandBuffer, 0);
+        recordCommandBuffer(commandBuffer, imageIndex);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        VkSemaphore waitSemaphores[] = {imageAvailableSemaphore};
+
+        // Per-STAGE waiting, not a blanket block: the vertex shader may run
+        // before the image is available, and only the colour write has to
+        // wait. The stage matches the subpass dependency from step 9a -- both
+        // sides of the handshake have to name the same stage or the layout
+        // transition can still race the acquire.
+        VkPipelineStageFlags waitStages[] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        };
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        // Indexed by the acquired image, not by frame: see the member
+        // declaration for why one shared semaphore is a spec violation.
+        VkSemaphore signalSemaphores[] = {
+            renderFinishedSemaphores[imageIndex]
+        };
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+
+        // The fence is signalled when this submission completes, which is
+        // exactly what the wait at the top of the next frame is waiting for.
+        if (vkQueueSubmit(graphicsAndComputeQueue, 1, &submitInfo,
+                          inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("failed to submit draw command buffer!");
+        }
+
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+
+        // So a half-drawn image is never displayed.
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = signalSemaphores;
+
+        VkSwapchainKHR swapChains[] = {swapChain};
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = swapChains;
+        presentInfo.pImageIndices = &imageIndex;
+
+        vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        reportFrameTiming();
+    }
+
+    void reportFrameTiming() {
+        using clock = std::chrono::steady_clock;
+
+        frameCounter++;
+
+        if (frameCounter == 1) {
+            std::cout << "First frame presented." << std::endl;
+            frameWindowStart = clock::now();
+            return;
+        }
+
+        if (frameCounter % 200 == 0) {
+            auto now = clock::now();
+            double ms =
+                std::chrono::duration<double, std::milli>(
+                    now - frameWindowStart).count() / 200.0;
+
+            std::cout << std::fixed << std::setprecision(2)
+                      << "frame " << frameCounter << ": " << ms
+                      << " ms avg, " << (1000.0 / ms) << " fps" << std::endl;
+
+            frameWindowStart = now;
+        }
+    }
+
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            drawFrame();
         }
+
+        // The loop exits the instant the window closes, but the GPU may still
+        // be executing the last frame. Destroying objects it is using would be
+        // a use-after-free. Brute-force, and correct only because this is
+        // shutdown -- never acceptable in a hot path.
+        vkDeviceWaitIdle(device);
     }
 
     void cleanup() {
         // Reverse creation order throughout. The sync objects were made last
         // and nothing references them, so they go first.
-        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+        for (auto semaphore : renderFinishedSemaphores) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
         vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
         vkDestroyFence(device, inFlightFence, nullptr);
 
