@@ -1,13 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 10 -- vulkan-tutorial.com "Frames in flight":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Frames_in_flight
+// Phase 2, step 11a -- vulkan-tutorial.com "Swap chain recreation":
+// https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
 //
-// Lets the CPU record frame N+1 while the GPU still executes frame N, by
-// giving each in-flight frame its own command buffer, image-available
-// semaphore and fence. Frames in flight and swapchain image count are
-// independent numbers -- which is why the render-finished semaphores stay
-// per IMAGE here rather than following the rest to per-frame.
+// A swapchain is built for one exact surface state, and goes stale when the
+// window resizes or moves to a display with a different scale factor. Vulkan
+// reports that as OUT_OF_DATE or SUBOPTIMAL from acquire and present; this
+// rebuilds only the swapchain-shaped objects in response. The window is still
+// non-resizable -- step 11b turns that on.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -204,6 +204,10 @@ private:
     // MAX_FRAMES_IN_FLIGHT indexed by currentFrame there, which reintroduces
     // exactly the violation above -- frames in flight and image count are
     // independent numbers, and this one belongs to the image.
+    //
+    // Belonging to the image also means sharing its lifetime: these are
+    // rebuilt with the swapchain in recreateSwapChain(), not kept alongside
+    // the per-frame objects.
     std::vector<VkSemaphore> renderFinishedSemaphores;
 
     // Only so the frame rate can be reported. FIFO is vsync, so the average
@@ -235,6 +239,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createRenderFinishedSemaphores();
         createRenderPass();
         createGraphicsPipeline();
         createFramebuffers();
@@ -731,8 +736,11 @@ private:
         // window. Only unsafe if we needed to read those pixels back.
         createInfo.clipped = VK_TRUE;
 
-        // Becomes meaningful in step 11a, where a resize builds a replacement
-        // swapchain and passes the outgoing one in here.
+        // Stays null even on recreation. recreateSwapChain() destroys the old
+        // swapchain BEFORE building the new one, so there is nothing to hand
+        // over. Using this properly would mean keeping the old swapchain alive
+        // through creation, which would let presentation continue from it
+        // during a resize instead of pausing.
         createInfo.oldSwapchain = VK_NULL_HANDLE;
 
         if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapChain) !=
@@ -1091,16 +1099,6 @@ private:
             }
         }
 
-        renderFinishedSemaphores.resize(swapChainImages.size());
-        for (size_t i = 0; i < swapChainImages.size(); i++) {
-            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
-                                  &renderFinishedSemaphores[i]) !=
-                VK_SUCCESS) {
-                throw std::runtime_error(
-                    "failed to create synchronization objects for a frame!");
-            }
-        }
-
         std::cout << "Sync objects created:\n"
                   << "\timageAvailable semaphores: "
                   << imageAvailableSemaphores.size()
@@ -1114,6 +1112,69 @@ private:
                   << "\tcommand buffers:           "
                   << commandBuffers.size() << " (one per frame in flight)"
                   << std::endl;
+    }
+
+    // Per swapchain IMAGE, so these share the images' lifetime: built with
+    // them here and destroyed with them in cleanupSwapChain(). A rebuild could
+    // in principle change the image count, and a vector kept from before would
+    // then be indexed out of bounds by imageIndex.
+    void createRenderFinishedSemaphores() {
+        VkSemaphoreCreateInfo semaphoreInfo{};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        renderFinishedSemaphores.resize(swapChainImages.size());
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr,
+                                  &renderFinishedSemaphores[i]) !=
+                VK_SUCCESS) {
+                throw std::runtime_error(
+                    "failed to create render-finished semaphores!");
+            }
+        }
+    }
+
+    // Everything whose shape depends on the swapchain, gathered so a rebuild
+    // can throw away exactly this and nothing else.
+    void cleanupSwapChain() {
+        // Framebuffers reference the image views, so they go first.
+        for (auto framebuffer : swapChainFramebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+
+        // Views reference images the swapchain owns, so before the swapchain.
+        for (auto imageView : swapChainImageViews) {
+            vkDestroyImageView(device, imageView, nullptr);
+        }
+
+        // The swapchain's VkImages go with it; they need no calls of their own.
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
+
+        // After the swapchain, whose destruction releases the presentation
+        // engine's hold on these.
+        for (auto semaphore : renderFinishedSemaphores) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    }
+
+    void recreateSwapChain() {
+        // Nothing still in flight may be using the objects about to go. Brute
+        // force, and acceptable only because recreation is rare.
+        vkDeviceWaitIdle(device);
+
+        cleanupSwapChain();
+
+        // Deliberately NOT rebuilt: the render pass and the pipeline. Step 5
+        // made viewport and scissor dynamic, so the pipeline bakes in no size.
+        // Step 6b's render-pass compatibility is decided by format, and a
+        // resize does not change the format. Moving between an SDR and an HDR
+        // display could, which would break that -- not a case handled here.
+        createSwapChain();
+        createImageViews();
+        createRenderFinishedSemaphores();
+        createFramebuffers();
+
+        std::cout << "Swapchain recreated at " << swapChainExtent.width << "x"
+                  << swapChainExtent.height << std::endl;
     }
 
     // SHADER_BINARY_DIR is baked in by CMakeLists.txt, so this path does not
@@ -1481,21 +1542,35 @@ private:
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE,
                         UINT64_MAX);
 
-        // Fences do NOT reset themselves. A binary semaphore is unsignalled by
-        // the wait that consumes it; a fence stays signalled until told
-        // otherwise, so frame two would wait on an already-signalled fence
-        // forever. Where this sits matters from step 11a on: reset only once a
-        // submit is certain, or an early return leaves the fence reset with
-        // nothing left to signal it.
-        vkResetFences(device, 1, &inFlightFences[currentFrame]);
-
         // Returns an index immediately -- the image is NOT ready yet. The call
         // says which image you will get; the semaphore says when it is
         // actually yours. That gap is why imageAvailableSemaphore exists.
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX,
-                              imageAvailableSemaphores[currentFrame],
-                              VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(
+            device, swapChain, UINT64_MAX,
+            imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE,
+            &imageIndex);
+
+        // OUT_OF_DATE: the swapchain no longer matches the surface and cannot
+        // be drawn into, so rebuild it and skip this frame. SUBOPTIMAL is a
+        // SUCCESS code and is deliberately let through here: an image has
+        // already been acquired and its semaphore is committed to being
+        // signalled, so carrying on is the consistent choice. It gets caught
+        // after present instead, once the frame is finished.
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapChain();
+            return;
+        } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
+        // Fences do NOT reset themselves: a binary semaphore is unsignalled by
+        // the wait that consumes it, but a fence stays signalled until told
+        // otherwise. Reset only here, once a submit is certain. Step 9b did it
+        // before the acquire, which deadlocks the moment the early return
+        // above fires -- the fence is left unsignalled with no submission
+        // coming to signal it, so the next wait on this slot never returns.
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
         // Allowed because the pool was created with
         // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT in step 8.
@@ -1551,7 +1626,15 @@ private:
         presentInfo.pSwapchains = swapChains;
         presentInfo.pImageIndices = &imageIndex;
 
-        vkQueuePresentKHR(presentQueue, &presentInfo);
+        result = vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        // By now the frame is finished, so rebuilding is clean for both codes.
+        if (result == VK_ERROR_OUT_OF_DATE_KHR ||
+            result == VK_SUBOPTIMAL_KHR) {
+            recreateSwapChain();
+        } else if (result != VK_SUCCESS) {
+            throw std::runtime_error("failed to present swap chain image!");
+        }
 
         // Hand the next frame the other slot, so its command buffer, semaphore
         // and fence are untouched by the work just submitted.
@@ -1599,45 +1682,36 @@ private:
     }
 
     void cleanup() {
-        // Reverse creation order throughout. The sync objects were made last
-        // and nothing references them, so they go first.
-        for (auto semaphore : renderFinishedSemaphores) {
-            vkDestroySemaphore(device, semaphore, nullptr);
-        }
+        // The rule that actually matters: destroy dependents before whatever
+        // they reference. Reverse creation order, which the earlier steps
+        // followed, is one convenient way to satisfy it; grouping the
+        // swapchain objects below is another. Strict reverse order no longer
+        // holds, but every reference still dies before its target.
+
+        // Per-frame sync objects. Nothing references them.
         for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
             vkDestroyFence(device, inFlightFences[i], nullptr);
         }
 
-        // Then the pool, which also
-        // happens to be the safer direction: freeing it frees the command
+        // The pool before the framebuffers: freeing it frees the command
         // buffers, so nothing recorded still refers to a framebuffer or
         // pipeline destroyed below. Command buffers need no call of their own.
         vkDestroyCommandPool(device, commandPool, nullptr);
 
-        // The framebuffers reference both
-        // the render pass and the image views, so they have to go before
-        // either -- which is also where reverse order puts them.
-        for (auto framebuffer : swapChainFramebuffers) {
-            vkDestroyFramebuffer(device, framebuffer, nullptr);
-        }
+        // Framebuffers, image views, the swapchain and its per-image
+        // render-finished semaphores. The framebuffers reference the render
+        // pass, which is why this comes before it.
+        cleanupSwapChain();
 
-        // Then the pipeline, the layout it used, and the render pass.
+        // The pipeline references its layout and the render pass, so it goes
+        // before both.
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
 
-        // The views go before the swapchain, since
-        // they reference images it owns; the swapchain before the device that
-        // made it; the messenger next; the instance outlives everything made
-        // through it. The swapchain's VkImages need no calls of their own --
-        // they go with the swapchain.
-        for (auto imageView : swapChainImageViews) {
-            vkDestroyImageView(device, imageView, nullptr);
-        }
-
-        vkDestroySwapchainKHR(device, swapChain, nullptr);
-
+        // The device made everything above; the messenger, surface and
+        // instance outlive it.
         vkDestroyDevice(device, nullptr);
 
         if (enableValidationLayers) {
