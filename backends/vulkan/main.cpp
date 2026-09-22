@@ -1,13 +1,13 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 11a -- vulkan-tutorial.com "Swap chain recreation":
+// Phase 2, step 11b -- vulkan-tutorial.com "Swap chain recreation":
 // https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
 //
-// A swapchain is built for one exact surface state, and goes stale when the
-// window resizes or moves to a display with a different scale factor. Vulkan
-// reports that as OUT_OF_DATE or SUBOPTIMAL from acquire and present; this
-// rebuilds only the swapchain-shaped objects in response. The window is still
-// non-resizable -- step 11b turns that on.
+// Makes the window resizable, which it has not been since Phase 1. Vulkan's
+// OUT_OF_DATE is NOT guaranteed on resize -- a driver may keep presenting a
+// mismatched swapchain and return success -- so GLFW reports the resize
+// directly through a callback instead. Minimisation needs its own handling,
+// since a 0x0 framebuffer cannot back a valid swapchain.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -210,6 +210,11 @@ private:
     // the per-frame objects.
     std::vector<VkSemaphore> renderFinishedSemaphores;
 
+    // Set from the GLFW callback, consumed after present. Needed because a
+    // driver is permitted to report VK_SUCCESS from a mismatched swapchain
+    // rather than OUT_OF_DATE, leaving the return codes silent on a resize.
+    bool framebufferResized = false;
+
     // Only so the frame rate can be reported. FIFO is vsync, so the average
     // should settle on the display's refresh interval rather than running
     // free -- which is the cheapest confirmation that frames really present.
@@ -224,11 +229,28 @@ private:
         // ourselves -- so that default has to be switched off.
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
-        // Resizing invalidates the swap chain and needs recreation logic,
-        // which arrives in Phase 2. Disabled until then.
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
+        // The GLFW_RESIZABLE hint that used to sit here is gone: resizing is
+        // GLFW's default, and the recreation logic it was waiting for now
+        // exists.
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+
+        // GLFW callbacks are plain C function pointers, so they cannot be
+        // non-static member functions -- there is no `this` to pass. The
+        // window user pointer is the standard bridge: stash the instance here,
+        // fetch it back inside the static callback. Phase 7's keyboard and
+        // mouse callbacks will need exactly the same arrangement.
+        glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    }
+
+    // Only records that a resize happened. It fires from inside
+    // glfwPollEvents, and rebuilding a swapchain from there would mean
+    // rebuilding it in the middle of a frame.
+    static void framebufferResizeCallback(GLFWwindow* window, int width,
+                                          int height) {
+        auto app =
+            reinterpret_cast<vulkan_app*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 
     void initVulkan() {
@@ -1157,6 +1179,18 @@ private:
     }
 
     void recreateSwapChain() {
+        // A minimised window reports a framebuffer of 0x0, and a swapchain
+        // with a zero extent is invalid -- creation would simply fail. Wait
+        // here until the window comes back. glfwWaitEvents blocks until an
+        // event arrives, unlike glfwPollEvents, so a minimised app idles
+        // rather than spinning a core.
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
         // Nothing still in flight may be using the objects about to go. Brute
         // force, and acceptable only because recreation is rare.
         vkDeviceWaitIdle(device);
@@ -1629,8 +1663,13 @@ private:
         result = vkQueuePresentKHR(presentQueue, &presentInfo);
 
         // By now the frame is finished, so rebuilding is clean for both codes.
+        // The flag is consulted alongside them because OUT_OF_DATE is NOT
+        // guaranteed on a resize: the spec lets a driver keep presenting a
+        // mismatched swapchain and return VK_SUCCESS, which would leave the
+        // image stretched with nothing to signal it.
         if (result == VK_ERROR_OUT_OF_DATE_KHR ||
-            result == VK_SUBOPTIMAL_KHR) {
+            result == VK_SUBOPTIMAL_KHR || framebufferResized) {
+            framebufferResized = false;
             recreateSwapChain();
         } else if (result != VK_SUCCESS) {
             throw std::runtime_error("failed to present swap chain image!");
