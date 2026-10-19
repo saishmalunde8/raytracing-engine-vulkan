@@ -1,19 +1,25 @@
 // Vulkan backend entry point.
 //
-// Phase 2, step 11b -- vulkan-tutorial.com "Swap chain recreation":
-// https://vulkan-tutorial.com/Drawing_a_triangle/Swap_chain_recreation
+// Phase 3, step 1 -- vulkan-tutorial.com "Vertex input description":
+// https://vulkan-tutorial.com/Vertex_buffers/Vertex_input_description
 //
-// Makes the window resizable, which it has not been since Phase 1. Vulkan's
-// OUT_OF_DATE is NOT guaranteed on resize -- a driver may keep presenting a
-// mismatched swapchain and return success -- so GLFW reports the resize
-// directly through a callback instead. Minimisation needs its own handling,
-// since a 0x0 framebuffer cannot back a valid swapchain.
+// A GPU buffer is an untyped bag of bytes, so the pipeline has to be told how
+// to cut it into vertices and attributes. That layout is baked in at pipeline
+// creation time -- the fixed-function vertex fetch needs it before it can read
+// anything, so it cannot be supplied per draw. Nothing is uploaded here: this
+// step only writes the promise down. The shader still hardcodes its three
+// vertices, and deliberately so, because a vertex shader that declares `in`
+// variables needs a buffer bound to satisfy them and that buffer is step 2.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <glm/glm.hpp>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -113,6 +119,63 @@ struct SwapChainSupportDetails {
     VkSurfaceCapabilitiesKHR capabilities;   // image count and extent bounds
     std::vector<VkSurfaceFormatKHR> formats; // (format, colorSpace) pairs
     std::vector<VkPresentModeKHR> presentModes;
+};
+
+// One vertex, as it is laid out in memory. The two descriptions below are the
+// only thing that lets the hardware read a buffer of these: the buffer itself
+// carries no type information whatsoever.
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    // How far apart consecutive vertices sit, and when the read pointer
+    // advances. VERTEX advances once per vertex; INSTANCE would advance once
+    // per instance instead, which is how one mesh gets drawn thousands of
+    // times with per-copy data and no duplication of the mesh itself.
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+
+        // A slot number, not a buffer. vkCmdBindVertexBuffers binds a real
+        // buffer to slot 0 in step 2.
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    // One per `in` variable the vertex shader declares. location is the entire
+    // contract with GLSL -- field names are never matched against anything.
+    static std::array<VkVertexInputAttributeDescription, 2>
+    getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 2>
+            attributeDescriptions{};
+
+        // format reuses the image format enum, which reads oddly for a
+        // position. It only means "two 32-bit signed floats"; the R/G naming
+        // is vestigial. offsetof rather than a hand-counted byte offset, so
+        // struct padding can never silently desynchronise this from the type.
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+
+// The same three vertices shader.vert currently hardcodes, value for value, so
+// that step 2's switch to reading them from a buffer has to produce a picture
+// identical to this one. Nothing reads this array yet.
+const std::vector<Vertex> vertices = {
+    {{ 0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{ 0.5f,  0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}
 };
 
 class vulkan_app {
@@ -1315,14 +1378,27 @@ private:
             static_cast<uint32_t>(dynamicStates.size());
         dynamicState.pDynamicStates = dynamicStates.data();
 
-        // Empty on purpose: shader.vert hardcodes its three vertices, so
-        // nothing arrives from a buffer. Phase 3's "Vertex input description"
-        // step is exactly where this stops being empty.
+        // Both locals have to outlive vkCreateGraphicsPipelines below, which
+        // is the whole reason they are named here rather than built inline:
+        // the create-info stores only pointers to them, and the driver reads
+        // through those pointers during the call.
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+        // Baked into the pipeline rather than set per draw. Declaring
+        // attributes the vertex shader does not consume is legal, which is
+        // what lets this land a step before the shader reads them. The reverse
+        // -- a shader input with no matching attribute -- fails pipeline
+        // creation outright.
         VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
         vertexInputInfo.sType =
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 0;
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
+        vertexInputInfo.vertexBindingDescriptionCount = 1;
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+        vertexInputInfo.vertexAttributeDescriptionCount =
+            static_cast<uint32_t>(attributeDescriptions.size());
+        vertexInputInfo.pVertexAttributeDescriptions =
+            attributeDescriptions.data();
 
         // What the vertices form. TRIANGLE_LIST: every three vertices are one
         // triangle, with no reuse between them.
@@ -1421,7 +1497,19 @@ private:
                   << dynamicState.dynamicStateCount << " states)"
                   << "\n\tvertex input:  "
                   << vertexInputInfo.vertexBindingDescriptionCount
-                  << " bindings (vertices live in the shader)"
+                  << " binding at slot " << bindingDescription.binding
+                  << ", stride " << bindingDescription.stride << " B, "
+                  << vertexInputInfo.vertexAttributeDescriptionCount
+                  << " attributes"
+                  << "\n\t               location 0: offset "
+                  << attributeDescriptions[0].offset << " B, format "
+                  << attributeDescriptions[0].format
+                  << " (R32G32_SFLOAT, vec2 pos)"
+                  << "\n\t               location 1: offset "
+                  << attributeDescriptions[1].offset << " B, format "
+                  << attributeDescriptions[1].format
+                  << " (R32G32B32_SFLOAT, vec3 color)"
+                  << "\n\t               not consumed by shader.vert yet"
                   << "\n\ttopology:      TRIANGLE_LIST, "
                   << viewportState.viewportCount << " viewport"
                   << "\n\trasterizer:    FILL, cull BACK, front face CLOCKWISE"

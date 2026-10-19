@@ -13,6 +13,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
 
+# Header-only maths types (vec2/vec3 here, matrices once the camera arrives).
+# The CPU renderer has its own vec3 in include/raytracer/ and does not use
+# this; glm is the Vulkan backend's dependency alone.
+find_package(glm REQUIRED)
+
 add_executable(vulkan_backend
     backends/vulkan/main.cpp
 )
@@ -22,6 +27,10 @@ add_executable(vulkan_backend
 target_link_libraries(vulkan_backend PRIVATE
     Vulkan::Vulkan
     glfw
+    # glm 1.0 exports glm::glm, which is a real shared library, alongside this
+    # interface target. Only glm's types are used here, so there is nothing to
+    # link against at runtime and the header-only target is the honest one.
+    glm::glm-header-only
 )
 
 # ---- Shader compilation -----------------------------------------------------
