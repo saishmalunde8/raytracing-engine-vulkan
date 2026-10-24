@@ -1,15 +1,15 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 1 -- vulkan-tutorial.com "Vertex input description":
-// https://vulkan-tutorial.com/Vertex_buffers/Vertex_input_description
+// Phase 3, step 2a -- vulkan-tutorial.com "Vertex buffer creation":
+// https://vulkan-tutorial.com/Vertex_buffers/Vertex_buffer_creation
 //
-// A GPU buffer is an untyped bag of bytes, so the pipeline has to be told how
-// to cut it into vertices and attributes. That layout is baked in at pipeline
-// creation time -- the fixed-function vertex fetch needs it before it can read
-// anything, so it cannot be supplied per draw. Nothing is uploaded here: this
-// step only writes the promise down. The shader still hardcodes its three
-// vertices, and deliberately so, because a vertex shader that declares `in`
-// variables needs a buffer bound to satisfy them and that buffer is step 2.
+// Step 1 described the byte layout; this produces the bytes. Vulkan splits
+// what malloc fuses: vkCreateBuffer allocates nothing and only declares what
+// a region will be USED for, the driver then reports which memory types can
+// back that particular buffer, and only then is memory allocated and bound.
+// The buffer is filled here but deliberately not bound to a draw -- the
+// shader still hardcodes its vertices until step 2b, so this step can be
+// checked on allocation and cleanup alone.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -243,6 +243,13 @@ private:
     // still reading. Freed with the pool, so never in cleanup() by itself.
     std::vector<VkCommandBuffer> commandBuffers;
 
+    // Two handles for one buffer, because Vulkan separates what a region of
+    // memory is FOR from where that memory lives. The first carries the size
+    // and usage; the second is the storage. Both are destroyed by us, and in
+    // that order -- see cleanup().
+    VkBuffer vertexBuffer;
+    VkDeviceMemory vertexBufferMemory;
+
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
@@ -329,6 +336,7 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
+        createVertexBuffer();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1072,6 +1080,161 @@ private:
 
         std::cout << "Command pool created on queue family "
                   << poolInfo.queueFamilyIndex << std::endl;
+    }
+
+    // Only the flags this backend will ever ask for. Which memory type an
+    // allocation landed on is the single observable fact a buffer produces,
+    // and it is unreadable as a hex mask.
+    static std::string memoryPropertyString(VkMemoryPropertyFlags flags) {
+        std::string out;
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            out += "DEVICE_LOCAL|";
+        }
+        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            out += "HOST_VISIBLE|";
+        }
+        if (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+            out += "HOST_COHERENT|";
+        }
+        if (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
+            out += "HOST_CACHED|";
+        }
+        if (out.empty()) {
+            return "(none)";
+        }
+        out.pop_back();
+        return out;
+    }
+
+    // Two independent constraints have to be satisfied at once, which is why
+    // this takes two arguments.
+    //
+    // typeFilter is memoryTypeBits straight out of the buffer's requirements:
+    // bit i set means "memory type i is capable of backing this particular
+    // buffer". That is the hardware's constraint. properties is what we need
+    // from the memory -- mappable, device-local -- which is ours. The first
+    // type satisfying both wins.
+    uint32_t findMemoryType(uint32_t typeFilter,
+                            VkMemoryPropertyFlags properties) {
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            bool capable = typeFilter & (1 << i);
+
+            // ALL the requested bits, not any of them: a type offering
+            // HOST_VISIBLE when DEVICE_LOCAL was also asked for is no match.
+            bool suitable =
+                (memProperties.memoryTypes[i].propertyFlags & properties) ==
+                properties;
+
+            if (capable && suitable) {
+                return i;
+            }
+        }
+
+        throw std::runtime_error("failed to find a suitable memory type!");
+    }
+
+    void createVertexBuffer() {
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = bufferSize;
+
+        // What the buffer is FOR, which is checked against how it is later
+        // used. Not a hint.
+        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+
+        // Same reasoning as the swapchain's: only the graphics+compute family
+        // touches this, so no cross-family ownership transfer is needed.
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create vertex buffer!");
+        }
+
+        // Nothing has been allocated yet -- vertexBuffer is a description with
+        // no storage behind it. Only the driver knows which memory can back
+        // this particular buffer, so it is asked rather than assumed.
+        //
+        // size here can exceed bufferSize: alignment padding is the driver's
+        // business. Allocating bufferSize instead of memRequirements.size is a
+        // real bug that happens to work on forgiving hardware.
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+
+        // HOST_VISIBLE is what makes vkMapMemory below possible at all.
+        // HOST_COHERENT makes the memcpy visible to the GPU without an
+        // explicit vkFlushMappedMemoryRanges -- drop it and the copy can sit
+        // in a CPU cache the GPU never reads, with no validation complaint,
+        // because nothing illegal was done. It just was not finished.
+        allocInfo.memoryTypeIndex = findMemoryType(
+            memRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        // One allocation per buffer, as the tutorial does. The device limit
+        // maxMemoryAllocationCount is real and small, so this does not scale
+        // -- engines make a few large allocations and sub-allocate at offsets
+        // instead. Kept naive deliberately; the BVH upload is where it bites.
+        if (vkAllocateMemory(device, &allocInfo, nullptr,
+                             &vertexBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to allocate vertex buffer memory!");
+        }
+
+        // The final 0 is the offset into the allocation. It is non-zero only
+        // when several buffers share one allocation, which is the scheme the
+        // comment above describes and this code does not use.
+        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+
+        // Not a GPU operation: no queue, no command buffer, no synchronisation
+        // of any kind. A pointer and a copy.
+        void* data;
+        vkMapMemory(device, vertexBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, vertices.data(), static_cast<size_t>(bufferSize));
+        vkUnmapMemory(device, vertexBufferMemory);
+
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        // Printed in full because step 3's whole checkpoint is this table
+        // changing which row gets chosen. On unified memory the rows tend to
+        // be far less differentiated than on a discrete GPU.
+        std::cout << "Device memory: " << memProperties.memoryTypeCount
+                  << " types across " << memProperties.memoryHeapCount
+                  << " heap(s)" << std::endl;
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            std::cout << "\ttype " << i << ": heap "
+                      << memProperties.memoryTypes[i].heapIndex << ", "
+                      << memoryPropertyString(
+                             memProperties.memoryTypes[i].propertyFlags)
+                      << std::endl;
+        }
+
+        const VkMemoryType& chosen =
+            memProperties.memoryTypes[allocInfo.memoryTypeIndex];
+
+        std::cout << "Vertex buffer created:"
+                  << "\n\tcontents:  " << vertices.size() << " vertices x "
+                  << sizeof(vertices[0]) << " B = " << bufferSize
+                  << " B requested"
+                  << "\n\tallocated: " << memRequirements.size
+                  << " B, alignment " << memRequirements.alignment << " B"
+                  << "\n\tcan use:   memory type mask 0x" << std::hex
+                  << memRequirements.memoryTypeBits << std::dec
+                  << "\n\tchose:     type " << allocInfo.memoryTypeIndex
+                  << " on heap " << chosen.heapIndex << ", "
+                  << memoryPropertyString(chosen.propertyFlags)
+                  << "\n\tfilled by: map + memcpy + unmap"
+                  << "\n\tnot bound to any draw yet" << std::endl;
     }
 
     void createCommandBuffers() {
@@ -1825,6 +1988,12 @@ private:
         // buffers, so nothing recorded still refers to a framebuffer or
         // pipeline destroyed below. Command buffers need no call of their own.
         vkDestroyCommandPool(device, commandPool, nullptr);
+
+        // Buffer before its memory, and both after the pool: from step 2b a
+        // recorded command buffer refers to this buffer, and freeing memory
+        // still bound to a live buffer is invalid regardless.
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
 
         // Framebuffers, image views, the swapchain and its per-image
         // render-finished semaphores. The framebuffers reference the render
