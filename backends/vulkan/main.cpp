@@ -1,15 +1,15 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 2a -- vulkan-tutorial.com "Vertex buffer creation":
+// Phase 3, step 2b -- vulkan-tutorial.com "Vertex buffer creation":
 // https://vulkan-tutorial.com/Vertex_buffers/Vertex_buffer_creation
 //
-// Step 1 described the byte layout; this produces the bytes. Vulkan splits
-// what malloc fuses: vkCreateBuffer allocates nothing and only declares what
-// a region will be USED for, the driver then reports which memory types can
-// back that particular buffer, and only then is memory allocated and bound.
-// The buffer is filled here but deliberately not bound to a draw -- the
-// shader still hardcodes its vertices until step 2b, so this step can be
-// checked on allocation and cleanup alone.
+// Closes the loop the last two steps opened. The buffer is bound to the slot
+// the pipeline declared, the draw count comes from the data rather than a
+// literal, and shader.vert now reads its attributes instead of carrying them.
+// Note the division: the LAYOUT is immutable pipeline state, but WHICH buffer
+// supplies it is recorded per command buffer -- which is how one pipeline
+// draws many meshes. The shader holds no vertex data at all after this, so a
+// correct triangle can only have come through the buffer.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -1234,7 +1234,8 @@ private:
                   << " on heap " << chosen.heapIndex << ", "
                   << memoryPropertyString(chosen.propertyFlags)
                   << "\n\tfilled by: map + memcpy + unmap"
-                  << "\n\tnot bound to any draw yet" << std::endl;
+                  << "\n\tbound to:  binding slot 0 at record time"
+                  << std::endl;
     }
 
     void createCommandBuffers() {
@@ -1309,9 +1310,24 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        // 3 vertices, 1 instance, starting from vertex 0 and instance 0. That
-        // firstVertex is where gl_VertexIndex begins counting in shader.vert.
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        // Binds a real buffer to the slot the pipeline's binding description
+        // declared in step 1. Command buffer state, not pipeline state: the
+        // layout is baked into the pipeline, but which buffer supplies it is
+        // recorded here, which is how one pipeline draws many meshes.
+        VkBuffer vertexBuffers[] = {vertexBuffer};
+
+        // Parallel to the array above: the byte offset into each buffer where
+        // its vertex data starts. Non-zero only when several meshes share one
+        // buffer, which is the scheme that replaces one allocation per mesh.
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
+        // The count now comes from the data rather than a literal 3, which is
+        // the entire point of the phase: geometry has stopped being a property
+        // of the program. 1 instance; the two 0s are firstVertex and
+        // firstInstance, where fetching begins in the bound buffer.
+        vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0,
+                  0);
 
         vkCmdEndRenderPass(commandBuffer);
 
@@ -1672,7 +1688,6 @@ private:
                   << attributeDescriptions[1].offset << " B, format "
                   << attributeDescriptions[1].format
                   << " (R32G32B32_SFLOAT, vec3 color)"
-                  << "\n\t               not consumed by shader.vert yet"
                   << "\n\ttopology:      TRIANGLE_LIST, "
                   << viewportState.viewportCount << " viewport"
                   << "\n\trasterizer:    FILL, cull BACK, front face CLOCKWISE"
