@@ -1,15 +1,16 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 3a -- vulkan-tutorial.com "Staging buffer", the "Abstracting
-// buffer creation" section:
+// Phase 3, step 3b -- vulkan-tutorial.com "Staging buffer":
 // https://vulkan-tutorial.com/Vertex_buffers/Staging_buffer
 //
-// No new Vulkan here, and no behaviour change. Step 3b needs two buffers that
-// differ only in usage flags and memory properties, so the six-call create-
-// allocate-bind sequence moves into createBuffer() and those two things become
-// parameters. The map/memcpy/unmap stays OUT of the helper on purpose: filling
-// by mapping only works on host-visible memory, and in 3b the vertex buffer
-// becomes device-local and cannot be mapped at all.
+// The memory the CPU can write is not the memory the GPU reads fastest: on a
+// discrete GPU the fast memory is VRAM, which has no CPU pointer at all. So
+// the upload takes two hops -- memcpy into a host-visible staging buffer, then
+// ask the GPU to copy that into device-local memory. The second hop is the
+// real lesson: a buffer-to-buffer copy is work the GPU does, so unlike
+// map/memcpy it needs a command buffer, a queue submission and a wait. This is
+// the first submission outside the render loop, and it is the exact machinery
+// that will carry the BVH, primitives and materials later.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -1106,6 +1107,26 @@ private:
         return out;
     }
 
+    // Only the usage flags this backend sets. Printed because the two
+    // buffers below differ chiefly in these and in their memory properties.
+    static std::string bufferUsageString(VkBufferUsageFlags flags) {
+        std::string out;
+        if (flags & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) {
+            out += "TRANSFER_SRC|";
+        }
+        if (flags & VK_BUFFER_USAGE_TRANSFER_DST_BIT) {
+            out += "TRANSFER_DST|";
+        }
+        if (flags & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) {
+            out += "VERTEX_BUFFER|";
+        }
+        if (out.empty()) {
+            return "(none)";
+        }
+        out.pop_back();
+        return out;
+    }
+
     // Two independent constraints have to be satisfied at once, which is why
     // this takes two arguments.
     //
@@ -1200,6 +1221,7 @@ private:
             memProperties.memoryTypes[allocInfo.memoryTypeIndex];
 
         std::cout << label << ": " << size << " B requested"
+                  << "\n\tusage:     " << bufferUsageString(usage)
                   << "\n\tallocated: " << memRequirements.size
                   << " B, alignment " << memRequirements.alignment << " B"
                   << "\n\tcan use:   memory type mask 0x" << std::hex
@@ -1207,6 +1229,68 @@ private:
                   << "\n\tchose:     type " << allocInfo.memoryTypeIndex
                   << " on heap " << chosen.heapIndex << ", "
                   << memoryPropertyString(chosen.propertyFlags) << std::endl;
+    }
+
+    // Copying between two GPU buffers is WORK THE GPU DOES, unlike the
+    // map/memcpy in createVertexBuffer which is pure CPU. So it needs a
+    // command buffer, a queue submission and a wait -- the first submission
+    // this backend makes outside the render loop.
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                    VkDeviceSize size) {
+        // Reuses the render loop's pool. A separate short-lived pool created
+        // with TRANSIENT_BIT would let the driver optimise for throwaway
+        // buffers, which is the refinement the tutorial mentions and this
+        // does not take.
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+        // Recorded once and thrown away, which the driver may exploit. The
+        // per-frame buffers in the render loop cannot say this: they are
+        // re-recorded every frame.
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        // Offsets into source and destination, both zero here. They are what
+        // make it possible to copy one mesh into the middle of a shared
+        // buffer rather than a buffer of its own.
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        vkEndCommandBuffer(commandBuffer);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        // No semaphores and no fence. Any family supporting graphics or
+        // compute implicitly supports transfer, so family 0's queue serves.
+        // Hardware with a dedicated transfer-only family can upload faster;
+        // that is not chased here.
+        vkQueueSubmit(graphicsAndComputeQueue, 1, &submitInfo, VK_NULL_HANDLE);
+
+        // The blunt instrument: blocks the CPU until the whole queue drains.
+        // It is what makes freeing the staging buffer safe in the caller --
+        // doing that while the copy was still in flight would be a
+        // use-after-free the GPU commits, not the CPU. A fence would let many
+        // copies be submitted and waited on together, which is what will
+        // matter when uploading the BVH rather than one 60-byte triangle.
+        vkQueueWaitIdle(graphicsAndComputeQueue);
+
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
     void createVertexBuffer() {
@@ -1229,28 +1313,55 @@ private:
                       << std::endl;
         }
 
-        // HOST_VISIBLE is what makes vkMapMemory below possible at all.
+        // Hop one. The only buffer here the CPU can reach.
+        //
+        // TRANSFER_SRC permits it to be the source of a copy; a buffer that
+        // does not declare it cannot be copied from, and validation says so.
+        // HOST_VISIBLE is what makes vkMapMemory possible at all.
         // HOST_COHERENT makes the memcpy visible to the GPU without an
         // explicit vkFlushMappedMemoryRanges -- drop it and the copy can sit
         // in a CPU cache the GPU never reads, with no validation complaint,
         // because nothing illegal was done. It just was not finished.
-        createBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     vertexBuffer, vertexBufferMemory, "Vertex buffer");
+                     stagingBuffer, stagingBufferMemory, "Staging buffer");
 
         // Not a GPU operation: no queue, no command buffer, no synchronisation
-        // of any kind. A pointer and a copy. Deliberately not inside
-        // createBuffer, because it only works on host-visible memory.
+        // of any kind. A pointer and a copy.
         void* data;
-        vkMapMemory(device, vertexBufferMemory, 0, bufferSize, 0, &data);
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
         memcpy(data, vertices.data(), static_cast<size_t>(bufferSize));
-        vkUnmapMemory(device, vertexBufferMemory);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // Hop two's destination. DEVICE_LOCAL without HOST_VISIBLE means this
+        // buffer cannot be mapped at all -- changing a vertex now costs
+        // another staging round trip. Fast GPU reads, expensive CPU writes,
+        // which is the right trade for geometry uploaded once.
+        createBuffer(bufferSize,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer,
+                     vertexBufferMemory, "Vertex buffer");
+
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        // Safe only because copyBuffer waited for the queue to drain. These
+        // two are the only objects in this file destroyed outside cleanup(),
+        // and deliberately so: the staging buffer has no purpose past this
+        // point and keeping it would waste host-visible memory for the
+        // lifetime of the program.
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
 
         std::cout << "\tcontents:  " << vertices.size() << " vertices x "
                   << sizeof(vertices[0]) << " B"
-                  << "\n\tfilled by: map + memcpy + unmap"
+                  << "\n\tfilled by: staging buffer + vkCmdCopyBuffer"
+                  << "\n\tmappable:  no, device-local without HOST_VISIBLE"
                   << "\n\tbound to:  binding slot 0 at record time"
+                  << "\n\tstaging:   destroyed and freed after the copy"
                   << std::endl;
     }
 
