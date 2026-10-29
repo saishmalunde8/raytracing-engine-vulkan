@@ -1,16 +1,15 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 3b -- vulkan-tutorial.com "Staging buffer":
-// https://vulkan-tutorial.com/Vertex_buffers/Staging_buffer
+// Phase 3, step 4a -- vulkan-tutorial.com "Index buffer":
+// https://vulkan-tutorial.com/Vertex_buffers/Index_buffer
 //
-// The memory the CPU can write is not the memory the GPU reads fastest: on a
-// discrete GPU the fast memory is VRAM, which has no CPU pointer at all. So
-// the upload takes two hops -- memcpy into a host-visible staging buffer, then
-// ask the GPU to copy that into device-local memory. The second hop is the
-// real lesson: a buffer-to-buffer copy is work the GPU does, so unlike
-// map/memcpy it needs a command buffer, a queue submission and a wait. This is
-// the first submission outside the render loop, and it is the exact machinery
-// that will carry the BVH, primitives and materials later.
+// The state the chapter opens with, and the problem it exists to solve. Two
+// triangles now form a quad, but a TRIANGLE_LIST reuses nothing, so the two
+// corners on the shared diagonal are stored twice. There are no new Vulkan
+// calls in this step at all -- only data -- which is deliberate: it isolates
+// the geometry and its winding order from the index machinery that arrives in
+// 4b. A wrong winding here is culled in silence, with nothing in the logs, so
+// it is worth having only one suspect for a blank window.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -170,13 +169,29 @@ struct Vertex {
     }
 };
 
-// The same three vertices shader.vert currently hardcodes, value for value, so
-// that step 2's switch to reading them from a buffer has to produce a picture
-// identical to this one. Nothing reads this array yet.
+// A quad, as a TRIANGLE_LIST is forced to express one: six vertices for four
+// distinct corners, because a triangle list consumes vertices three at a time
+// with no reuse whatsoever. The two corners on the shared diagonal are stored
+// TWICE, byte for byte, and the hardware has no way to know they are the same
+// point -- so it transforms each copy separately. Step 4b removes the
+// duplication with an index buffer and must produce an identical picture.
+//
+// Winding matters here and fails silently: the rasterizer culls back faces
+// and treats clockwise as front. Both triangles below wind the same way as
+// the triangle this replaces, verified rather than assumed -- the shoelace sum
+// of each is +1.0, exactly as the old triangle's was. Y points DOWN, so
+// y = -0.5 is the TOP of the screen.
 const std::vector<Vertex> vertices = {
-    {{ 0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{ 0.5f,  0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}
+    // First triangle: top-left, top-right, bottom-right.
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // red
+    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // green
+    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // blue
+
+    // Second triangle: bottom-right, bottom-left, top-left. Its first and
+    // last entries duplicate vertices 2 and 0 above.
+    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // blue  (duplicate of 2)
+    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}}, // white
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}  // red   (duplicate of 0)
 };
 
 class vulkan_app {
