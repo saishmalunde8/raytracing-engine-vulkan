@@ -1,15 +1,18 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 4a -- vulkan-tutorial.com "Index buffer":
+// Phase 3, step 4b -- vulkan-tutorial.com "Index buffer":
 // https://vulkan-tutorial.com/Vertex_buffers/Index_buffer
 //
-// The state the chapter opens with, and the problem it exists to solve. Two
-// triangles now form a quad, but a TRIANGLE_LIST reuses nothing, so the two
-// corners on the shared diagonal are stored twice. There are no new Vulkan
-// calls in this step at all -- only data -- which is deliberate: it isolates
-// the geometry and its winding order from the index machinery that arrives in
-// 4b. A wrong winding here is culled in silence, with nothing in the logs, so
-// it is worth having only one suspect for a blank window.
+// Position in the vertex buffer stops deciding which vertices form a triangle.
+// A second buffer of integers decides instead, so the vertex buffer becomes a
+// POOL of unique vertices that any number of triangles can refer back into.
+// 4a's duplicated corners are gone and the picture must be unchanged.
+//
+// This is the layout the path tracer needs, not an optimisation detour: a
+// triangle in a BVH leaf is three indices into a shared vertex pool, which is
+// exactly this. Phase 3's whole purpose was to learn the upload machinery, and
+// the index buffer goes up through the same createBuffer + copyBuffer path the
+// vertices do -- the first evidence that the machinery generalises.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -169,29 +172,36 @@ struct Vertex {
     }
 };
 
-// A quad, as a TRIANGLE_LIST is forced to express one: six vertices for four
-// distinct corners, because a triangle list consumes vertices three at a time
-// with no reuse whatsoever. The two corners on the shared diagonal are stored
-// TWICE, byte for byte, and the hardware has no way to know they are the same
-// point -- so it transforms each copy separately. Step 4b removes the
-// duplication with an index buffer and must produce an identical picture.
-//
-// Winding matters here and fails silently: the rasterizer culls back faces
-// and treats clockwise as front. Both triangles below wind the same way as
-// the triangle this replaces, verified rather than assumed -- the shoelace sum
-// of each is +1.0, exactly as the old triangle's was. Y points DOWN, so
-// y = -0.5 is the TOP of the screen.
+// The quad's four corners, each stored exactly ONCE. This array no longer
+// describes triangles at all -- it is an unordered pool, and the order of
+// entries here means nothing beyond fixing what each index refers to. Y points
+// DOWN, so y = -0.5 is the TOP of the screen.
 const std::vector<Vertex> vertices = {
-    // First triangle: top-left, top-right, bottom-right.
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // red
-    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // green
-    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // blue
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // 0  top-left      red
+    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // 1  top-right     green
+    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // 2  bottom-right  blue
+    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}}  // 3  bottom-left   white
+};
 
-    // Second triangle: bottom-right, bottom-left, top-left. Its first and
-    // last entries duplicate vertices 2 and 0 above.
-    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // blue  (duplicate of 2)
-    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}}, // white
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}  // red   (duplicate of 0)
+// Which pool entry each corner of each triangle uses. THIS is now the geometry;
+// the array above is only storage. Index 2 and index 0 each appear twice, but
+// what repeats is a two-byte integer rather than a twenty-byte vertex -- and
+// because the repeat is an INDEX, the hardware's post-transform cache can
+// recognise it and skip re-running the vertex shader. Identical bytes in 4a's
+// duplicated vertices gave it nothing to match on.
+//
+// Both triples wind the same way as 4a's triangles did, which is what keeps
+// them from being culled in silence: 0,1,2 is top-left -> top-right ->
+// bottom-right, and 2,3,0 is bottom-right -> bottom-left -> top-left.
+//
+// uint16_t caps the pool at 65535 vertices, which a real mesh outgrows
+// immediately; uint32_t with VK_INDEX_TYPE_UINT32 is then the swap, at double
+// the index memory. The type here and the enum passed to vkCmdBindIndexBuffer
+// must agree, and nothing checks that they describe the same thing -- see
+// recordCommandBuffer.
+const std::vector<uint16_t> indices = {
+    0, 1, 2,
+    2, 3, 0
 };
 
 class vulkan_app {
@@ -265,6 +275,14 @@ private:
     // that order -- see cleanup().
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
+
+    // The same pair again for the indices. Separate buffers because they are
+    // bound by different calls and read by different fixed-function hardware,
+    // not because Vulkan requires it -- one allocation holding both at
+    // different offsets is normal practice and what the offset arguments in
+    // vkCmdBindVertexBuffers and vkCmdBindIndexBuffer exist for.
+    VkBuffer indexBuffer;
+    VkDeviceMemory indexBufferMemory;
 
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
@@ -353,6 +371,7 @@ private:
         createFramebuffers();
         createCommandPool();
         createVertexBuffer();
+        createIndexBuffer();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1135,6 +1154,9 @@ private:
         if (flags & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) {
             out += "VERTEX_BUFFER|";
         }
+        if (flags & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) {
+            out += "INDEX_BUFFER|";
+        }
         if (out.empty()) {
             return "(none)";
         }
@@ -1380,6 +1402,54 @@ private:
                   << std::endl;
     }
 
+    // Structurally identical to createVertexBuffer, and that is the finding
+    // worth noticing: only the usage flag and the source pointer differ. The
+    // staging path built in step 3 was not vertex-specific, so it carries
+    // indices unchanged -- and will carry BVH nodes, primitives and materials
+    // the same way. The reasoning behind each flag is in createVertexBuffer.
+    void createIndexBuffer() {
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer, stagingBufferMemory,
+                     "Index staging buffer");
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, indices.data(), static_cast<size_t>(bufferSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // INDEX_BUFFER rather than VERTEX_BUFFER is the entire difference in
+        // intent. A buffer without this flag cannot be bound as an index
+        // buffer, and that one IS caught by validation.
+        createBuffer(bufferSize,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer,
+                     indexBufferMemory, "Index buffer");
+
+        copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+        VkDeviceSize vertexBytes = sizeof(vertices[0]) * vertices.size();
+        std::cout << "\tcontents:  " << indices.size() << " indices x "
+                  << sizeof(indices[0]) << " B as uint16_t"
+                  << "\n\tfilled by: staging buffer + vkCmdCopyBuffer, the same"
+                     " path as the vertices"
+                  << "\n\tbound to:  no slot number -- one index buffer is bound"
+                     " at a time"
+                  << "\n\tgeometry:  " << vertices.size() << " vertices ("
+                  << vertexBytes << " B) + " << indices.size() << " indices ("
+                  << bufferSize << " B) = " << (vertexBytes + bufferSize)
+                  << " B, was 120 B as 6 vertices" << std::endl;
+    }
+
     void createCommandBuffers() {
         commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
 
@@ -1464,12 +1534,28 @@ private:
         VkDeviceSize offsets[] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
 
-        // The count now comes from the data rather than a literal 3, which is
-        // the entire point of the phase: geometry has stopped being a property
-        // of the program. 1 instance; the two 0s are firstVertex and
-        // firstInstance, where fetching begins in the bound buffer.
-        vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0,
-                  0);
+        // No slot number, unlike the vertex buffers above: a pipeline can read
+        // several vertex buffers at once but only ever one index buffer, so
+        // there is nothing to index the binding by. The 0 is a byte offset.
+        //
+        // VK_INDEX_TYPE_UINT16 has to match the C++ element type, and NOTHING
+        // CHECKS THAT IT DOES -- the buffer is untyped bytes, exactly as the
+        // vertex buffer is. Declaring UINT32 over uint16_t data is perfectly
+        // legal and silently reads each pair of indices as one huge number,
+        // which then either draws nothing or trips an out-of-bounds read.
+        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0,
+                             VK_INDEX_TYPE_UINT16);
+
+        // vkCmdDrawIndexed, not vkCmdDraw. The first count is now the number
+        // of INDICES to walk, not vertices to fetch -- 6 here, from a pool of
+        // 4 -- and getting that wrong is the easy mistake, because
+        // vertices.size() still compiles and still draws something.
+        //
+        // After the instance count: firstIndex, then vertexOffset (added to
+        // every index, which is how several meshes share one vertex pool), then
+        // firstInstance.
+        vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()),
+                         1, 0, 0, 0);
 
         vkCmdEndRenderPass(commandBuffer);
 
@@ -2151,6 +2237,9 @@ private:
         // still bound to a live buffer is invalid regardless.
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         vkFreeMemory(device, vertexBufferMemory, nullptr);
+
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        vkFreeMemory(device, indexBufferMemory, nullptr);
 
         // Framebuffers, image views, the swapchain and its per-image
         // render-finished semaphores. The framebuffers reference the render
