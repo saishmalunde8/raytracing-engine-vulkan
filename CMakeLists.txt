@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Vulkan REQUIRED)
 find_package(glfw3 REQUIRED)
 
-# Header-only maths types (vec2/vec3 here, matrices once the camera arrives).
+# Header-only maths types (vec2/vec3 here, matrices from Phase 4 on).
 # The CPU renderer has its own vec3 in include/raytracer/ and does not use
 # this; glm is the Vulkan backend's dependency alone.
 find_package(glm REQUIRED)

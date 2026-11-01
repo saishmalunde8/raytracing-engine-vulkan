@@ -1,22 +1,48 @@
 // Vulkan backend entry point.
 //
-// Phase 3, step 4b -- vulkan-tutorial.com "Index buffer":
-// https://vulkan-tutorial.com/Vertex_buffers/Index_buffer
+// Phase 4, step 1 -- vulkan-tutorial.com "Descriptor layout and buffer":
+// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_layout_and_buffer
 //
-// Position in the vertex buffer stops deciding which vertices form a triangle.
-// A second buffer of integers decides instead, so the vertex buffer becomes a
-// POOL of unique vertices that any number of triangles can refer back into.
-// 4a's duplicated corners are gone and the picture must be unchanged.
+// Phase 3 taught the GPU to read geometry. Nothing in it taught a SHADER to
+// read memory: fixed-function hardware fetched each vertex and HANDED its
+// attributes over as `in` variables, which is the one case in Vulkan where no
+// descriptor is involved. Everything else a shader reads -- a camera matrix, a
+// BVH, a material table, an output image -- it has to reach for itself, and a
+// descriptor is the mechanism. That makes this the phase every later one sits
+// on.
 //
-// This is the layout the path tracer needs, not an optimisation detour: a
-// triangle in a BVH leaf is three indices into a shared vertex pool, which is
-// exactly this. Phase 3's whole purpose was to learn the upload machinery, and
-// the index buffer goes up through the same createBuffer + copyBuffer path the
-// vertices do -- the first evidence that the machinery generalises.
+// Three objects with three jobs, and the names are most of the difficulty.
+// The LAYOUT is a schema: "slot 0 holds one uniform buffer the vertex stage
+// may read", naming no buffer and touching no memory. The POOL is where sets
+// are allocated from, and the SET is a row filled in against the schema --
+// "slot 0 is THIS buffer". This step builds the schema and the buffer the slot
+// will eventually point at; the pool and the set are step 2.
+//
+// Nothing is bound to a shader here, so the picture must be exactly what it
+// was -- the same quad, no validation messages. pipelineLayout, created empty
+// since Phase 2, finally carries something. A pipeline layout is allowed to
+// declare more than its shaders use, which is what makes that possible.
+//
+// Deliberate deviation: the tutorial rewrites shader.vert on this page, which
+// leaves it reading a descriptor nobody has bound and nothing correct to look
+// at until the next page. The shader change is step 2 here instead, so this
+// step's checkpoint is falsifiable on its own.
+//
+// The uniform buffers also invert Phase 3's conclusion about where GPU-read
+// data belongs, which is the real lesson of the step -- see
+// createUniformBuffers.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+// Angles in radians everywhere, before glm is included. GLM's historical
+// default was degrees and some builds still accept both, so a glm::rotate call
+// given 45.0f can silently mean 45 radians instead -- a factor of 57 that
+// renders as something plausible rather than as an error. Forcing it is how
+// that ambiguity stops existing. Phase 4 is the first phase with any angles in
+// it at all; glm::rotate itself arrives with the rotation in step 3, and the
+// gtc/matrix_transform.hpp header it needs comes with it.
+#define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
 
 #include <algorithm>
@@ -204,6 +230,29 @@ const std::vector<uint16_t> indices = {
     2, 3, 0
 };
 
+// What the vertex shader will read out of slot 0 once step 2 binds it. Plain
+// C++ with no Vulkan types in it: the struct is never handed to a Vulkan call,
+// only its SIZE is, and the bytes arrive by memcpy. The GPU's interpretation
+// of those bytes comes entirely from the matching `layout(binding = 0)
+// uniform` block in the shader, and NOTHING CHECKS THE TWO AGREE -- the same
+// untyped-bytes hazard as declaring VK_INDEX_TYPE_UINT16 over the index data.
+//
+// One member, where the tutorial has three (model, view, proj). A 2D quad has
+// no camera to look through, so view and proj would be identity matrices
+// carried for two phases with nothing to say. They arrive in Phase 6 with the
+// real camera.
+//
+// The trap that a single mat4 happens to hide: GLSL's std140 rules align a
+// vec2 to 8 bytes, a vec3 or vec4 and a nested struct to 16, while C++ aligns
+// each member by its own size. A mat4 is 16-byte aligned on both sides, so
+// this struct cannot go wrong. The moment a vec3 joins it -- Phase 6's camera
+// origin -- `alignas(16)` on every member, or GLM_FORCE_DEFAULT_ALIGNED_
+// GENTYPES before the glm include, becomes mandatory. Getting it wrong feeds
+// the shader shifted garbage with a perfectly clean validation log.
+struct UniformBufferObject {
+    glm::mat4 model;
+};
+
 class vulkan_app {
 public:
     void run() {
@@ -283,6 +332,30 @@ private:
     // vkCmdBindVertexBuffers and vkCmdBindIndexBuffer exist for.
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
+
+    // The SHAPE of the resource slots a shader may read -- not the resources.
+    // One schema, created once, outlived by nothing: the pipeline layout built
+    // from it is the only thing that refers to it.
+    VkDescriptorSetLayout descriptorSetLayout;
+
+    // One per frame in flight, NOT one per swapchain image. The hazard being
+    // avoided is overwriting a buffer the GPU is still reading from a
+    // submission already in flight, and the number of those is
+    // MAX_FRAMES_IN_FLIGHT by definition. The render-finished semaphores above
+    // are the same asymmetry seen from the other side: that object belongs to
+    // the IMAGE, this one belongs to the FRAME.
+    //
+    // A single shared UBO would corrupt the frame still executing, and with
+    // HOST_COHERENT memory there is nothing to notice it -- no validation
+    // error, just the wrong transform for one frame.
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+
+    // Mapped at creation and never unmapped -- "persistent mapping".
+    // vkMapMemory is not free, and this memory is rewritten every frame for
+    // the life of the program, so mapping and unmapping it 60 times a second
+    // pays that cost for nothing. The pointers stay valid until vkFreeMemory.
+    std::vector<void*> uniformBuffersMapped;
 
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
@@ -367,11 +440,16 @@ private:
         createImageViews();
         createRenderFinishedSemaphores();
         createRenderPass();
+
+        // Before the pipeline: the pipeline layout is built from this, and the
+        // pipeline from that.
+        createDescriptorSetLayout();
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
         createVertexBuffer();
         createIndexBuffer();
+        createUniformBuffers();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1157,6 +1235,9 @@ private:
         if (flags & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) {
             out += "INDEX_BUFFER|";
         }
+        if (flags & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) {
+            out += "UNIFORM_BUFFER|";
+        }
         if (out.empty()) {
             return "(none)";
         }
@@ -1448,6 +1529,116 @@ private:
                   << vertexBytes << " B) + " << indices.size() << " indices ("
                   << bufferSize << " B) = " << (vertexBytes + bufferSize)
                   << " B, was 120 B as 6 vertices" << std::endl;
+    }
+
+    // Declares the SHAPE of what a shader can reach: "there is a slot 0, it
+    // holds one uniform buffer, and the vertex stage may read it." No buffer
+    // is named and no memory is touched. This is a schema; the set created
+    // from it in step 2 is a row filled in against the schema.
+    void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+
+        // The number the shader writes in `layout(binding = 0)`. A slot inside
+        // this set, with no relation to the vertex input binding 0 from Phase
+        // 3 -- separate namespaces, exactly as the shader's `location = 0` for
+        // a vertex attribute and `location = 0` for a stage output already
+        // are.
+        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+
+        // One DESCRIPTOR -- not one byte and not one buffer. A count above 1
+        // makes the binding an array in the shader, `uniform Foo { ... }
+        // foo[N]`, which is how the path tracer will expose a table of
+        // materials or textures through a single binding.
+        uboLayoutBinding.descriptorCount = 1;
+
+        // Which stages may read it, and not merely a hint: a stage left out
+        // cannot see the binding at all, and the compiler may rely on that.
+        // The compute path tracer sets VK_SHADER_STAGE_COMPUTE_BIT here.
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        // Only meaningful for SAMPLER and COMBINED_IMAGE_SAMPLER descriptors,
+        // where a sampler's state can be frozen into the layout itself.
+        uboLayoutBinding.pImmutableSamplers = nullptr;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
+                                        &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to create descriptor set layout!");
+        }
+
+        std::cout << "Descriptor set layout created: "
+                  << layoutInfo.bindingCount << " binding"
+                  << "\n\tbinding 0:  UNIFORM_BUFFER x"
+                  << uboLayoutBinding.descriptorCount
+                  << ", readable by VERTEX"
+                  << "\n\tdescribes:  "
+                  << sizeof(UniformBufferObject)
+                  << " B of UniformBufferObject (one mat4)"
+                  << "\n\tpoints at:  nothing -- a layout names no buffer"
+                  << std::endl;
+    }
+
+    // The step's real lesson, and it reads as a contradiction of Phase 3 until
+    // the reason is said out loud.
+    //
+    // Phase 3 concluded that data the GPU reads belongs in DEVICE_LOCAL memory
+    // the CPU cannot touch, delivered through a staging buffer. A uniform
+    // buffer takes the opposite choice: HOST_VISIBLE | HOST_COHERENT, mapped
+    // once and never unmapped. Both are right, because the access patterns are
+    // opposites. Vertices are written once and read millions of times, so one
+    // staging round trip is free. A UBO is rewritten EVERY FRAME and read a
+    // handful of times, so staging it would mean a second buffer, a command
+    // buffer, a queue submit and a wait, sixty times a second, to move 64
+    // bytes.
+    //
+    // The rule neither phase states alone: match the memory type to the ACCESS
+    // PATTERN, not to who reads it. Phase 3's answer was never "GPU data goes
+    // in device-local memory"; it was "uploaded-once data does".
+    //
+    // No TRANSFER_DST and no staging buffer here is the visible shape of that
+    // argument -- compare createIndexBuffer, which is otherwise the same few
+    // lines.
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         uniformBuffers[i], uniformBuffersMemory[i],
+                         "Uniform buffer " + std::to_string(i));
+
+            // Mapped here and never unmapped. vkFreeMemory unmaps implicitly
+            // at shutdown, so cleanup() needs no vkUnmapMemory -- but these
+            // pointers must not be dereferenced after that free.
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0,
+                        &uniformBuffersMapped[i]);
+        }
+
+        std::cout << "Uniform buffers: " << MAX_FRAMES_IN_FLIGHT << " x "
+                  << bufferSize << " B, one per frame in flight"
+                  << "\n\tfilled by:  memcpy through a persistent mapping --"
+                     " no staging, no command buffer, no submit"
+                  << "\n\tmappable:   yes, host-visible BY DESIGN, the"
+                     " opposite choice to the vertex buffer"
+                  << "\n\tmapped at: ";
+        for (size_t i = 0; i < uniformBuffersMapped.size(); i++) {
+            std::cout << " [" << i << "] " << uniformBuffersMapped[i];
+        }
+        std::cout << "\n\tbound to:   nothing -- binding one needs a"
+                     " descriptor SET, which step 2 allocates"
+                  << std::endl;
     }
 
     void createCommandBuffers() {
@@ -1885,13 +2076,26 @@ private:
         colorBlending.pAttachments = &colorBlendAttachment;
 
         // The shaders' uniform interface: which descriptor sets and push
-        // constants they can see. Empty, because these two read nothing from
-        // outside. Phase 4 is where the path tracer's BVH, primitive,
-        // material, camera and image bindings get declared right here.
+        // constants they can see. Created empty since Phase 2, because the two
+        // shaders read nothing from outside. It now carries set 0's layout --
+        // the first time this pipeline declares access to memory a shader
+        // reaches by itself, and the slot the path tracer's BVH, primitive,
+        // material, camera and image bindings will join.
+        //
+        // The LAYOUT, never a set: the pipeline is compiled against the schema,
+        // and which actual buffer fills it is command-buffer state decided per
+        // draw. Same separation as the vertex binding slot versus
+        // vkCmdBindVertexBuffers, and the reason one pipeline can draw many
+        // meshes.
+        //
+        // Declaring more than the shaders use is legal, which is what makes
+        // this step invisible: slot 0 exists here, and shader.vert still does
+        // not mention it. Step 2 changes that.
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType =
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0;
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
         pipelineLayoutInfo.pushConstantRangeCount = 0;
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
@@ -1923,6 +2127,11 @@ private:
                   << multisampling.rasterizationSamples << " sample"
                   << "\n\tblending:      off, "
                   << colorBlending.attachmentCount << " attachment"
+                  << "\n\tuniforms:      "
+                  << pipelineLayoutInfo.setLayoutCount
+                  << " descriptor set layout at set 0, "
+                  << pipelineLayoutInfo.pushConstantRangeCount
+                  << " push constant ranges"
                   << std::endl;
 
         // ---- The pipeline object itself ----
@@ -2065,6 +2274,48 @@ private:
         }
     }
 
+    // Called once per frame, before the draw is submitted. Writing to
+    // uniformBuffersMapped[currentFrame] is safe ONLY because drawFrame has
+    // already waited on that slot's fence, so the submission that last read
+    // this buffer has completed. Writing the slot the GPU is reading right now
+    // is the classic uniform-buffer bug, and HOST_COHERENT memory makes it
+    // silent -- the frame in flight simply uses whatever landed mid-read.
+    //
+    // Identity, deliberately. Step 2 binds this buffer to the shader and the
+    // quad must then look EXACTLY as it does now; a rotation introduced in the
+    // same step would make "the plumbing works" and "the matrix is animating"
+    // indistinguishable, which is precisely how a bound-but-never-updated
+    // descriptor hides. The time-based rotation is step 3, a small change on
+    // top of a known-good reference.
+    void updateUniformBuffer(uint32_t currentImage) {
+        UniformBufferObject ubo{};
+        ubo.model = glm::mat4(1.0f);
+
+        // No flush call, because the memory is HOST_COHERENT: this write is
+        // visible to the GPU by the time the submit below happens. Drop
+        // HOST_COHERENT and the memcpy needs vkFlushMappedMemoryRanges, and
+        // leaving it out is legal, silent and wrong -- Phase 3's staging
+        // hazard again, in the one place it is easiest to forget.
+        memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+
+        // Evidence for a checkpoint with nothing to look at, then silence.
+        // The write is proved by reading the bytes back THROUGH the mapping --
+        // which is itself what host-visible memory means -- and the per-frame
+        // claim by watching the slot alternate 0, 1, 0 over the first frames.
+        // frameCounter is still 0 on the first drawFrame; reportFrameTiming
+        // increments it at the end of the frame.
+        if (frameCounter <= MAX_FRAMES_IN_FLIGHT) {
+            const UniformBufferObject* readBack =
+                static_cast<const UniformBufferObject*>(
+                    uniformBuffersMapped[currentImage]);
+            std::cout << "Uniform write: slot " << currentImage << " at "
+                      << uniformBuffersMapped[currentImage] << ", "
+                      << sizeof(ubo) << " B, read back model[0][0] = "
+                      << readBack->model[0][0] << ", model[3][3] = "
+                      << readBack->model[3][3] << std::endl;
+        }
+    }
+
     void drawFrame() {
         // Wait for the previous frame's GPU work. UINT64_MAX means no timeout.
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE,
@@ -2099,6 +2350,12 @@ private:
         // above fires -- the fence is left unsignalled with no submission
         // coming to signal it, so the next wait on this slot never returns.
         vkResetFences(device, 1, &inFlightFences[currentFrame]);
+
+        // After the fence wait above, so the GPU has finished reading this
+        // slot; before the submit below, so the bytes are in place when it
+        // starts. Also after the OUT_OF_DATE early return -- a frame that is
+        // abandoned should not write anything.
+        updateUniformBuffer(currentFrame);
 
         // Allowed because the pool was created with
         // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT in step 8.
@@ -2241,6 +2498,14 @@ private:
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
 
+        // The same pair once per frame in flight. No vkUnmapMemory call:
+        // vkFreeMemory unmaps implicitly, and uniformBuffersMapped holds
+        // dangling pointers from here on.
+        for (size_t i = 0; i < uniformBuffers.size(); i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
         // Framebuffers, image views, the swapchain and its per-image
         // render-finished semaphores. The framebuffers reference the render
         // pass, which is why this comes before it.
@@ -2250,6 +2515,12 @@ private:
         // before both.
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
+        // After the pipeline layout built from it, by the same rule as
+        // everything else here. A layout is only a schema, so once that
+        // pipeline layout is gone nothing of ours still refers to it.
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+
         vkDestroyRenderPass(device, renderPass, nullptr);
 
         // The device made everything above; the messenger, surface and
