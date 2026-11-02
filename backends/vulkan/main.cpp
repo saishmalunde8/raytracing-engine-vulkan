@@ -1,36 +1,31 @@
 // Vulkan backend entry point.
 //
-// Phase 4, step 1 -- vulkan-tutorial.com "Descriptor layout and buffer":
-// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_layout_and_buffer
+// Phase 4, step 2 -- vulkan-tutorial.com "Descriptor pool and sets":
+// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_pool_and_sets
 //
-// Phase 3 taught the GPU to read geometry. Nothing in it taught a SHADER to
-// read memory: fixed-function hardware fetched each vertex and HANDED its
-// attributes over as `in` variables, which is the one case in Vulkan where no
-// descriptor is involved. Everything else a shader reads -- a camera matrix, a
-// BVH, a material table, an output image -- it has to reach for itself, and a
-// descriptor is the mechanism. That makes this the phase every later one sits
-// on.
+// Step 1 left a schema and a buffer with nothing joining them. Three things
+// close the gap, and they are deliberately three separate mechanisms:
 //
-// Three objects with three jobs, and the names are most of the difficulty.
-// The LAYOUT is a schema: "slot 0 holds one uniform buffer the vertex stage
-// may read", naming no buffer and touching no memory. The POOL is where sets
-// are allocated from, and the SET is a row filled in against the schema --
-// "slot 0 is THIS buffer". This step builds the schema and the buffer the slot
-// will eventually point at; the pool and the set are step 2.
+//   createDescriptorPool    the allocator, sized up front and unable to grow
+//   createDescriptorSets    allocates the sets, then vkUpdateDescriptorSets
+//                           writes the buffer's address INTO each one -- on
+//                           the host, immediately, with no command buffer
+//   recordCommandBuffer     vkCmdBindDescriptorSets, per frame, alongside the
+//                           vertex and index buffer bindings
 //
-// Nothing is bound to a shader here, so the picture must be exactly what it
-// was -- the same quad, no validation messages. pipelineLayout, created empty
-// since Phase 2, finally carries something. A pipeline layout is allowed to
-// declare more than its shaders use, which is what makes that possible.
+// shader.vert now declares `layout(binding = 0) uniform ... ubo` and
+// multiplies gl_Position by ubo.model. That completes the chain this phase
+// exists to teach: a shader reaching memory by itself rather than being handed
+// attributes by fixed-function hardware.
 //
-// Deliberate deviation: the tutorial rewrites shader.vert on this page, which
-// leaves it reading a descriptor nobody has bound and nothing correct to look
-// at until the next page. The shader change is step 2 here instead, so this
-// step's checkpoint is falsifiable on its own.
-//
-// The uniform buffers also invert Phase 3's conclusion about where GPU-read
-// data belongs, which is the real lesson of the step -- see
-// createUniformBuffers.
+// The matrix is still identity, so the quad must look EXACTLY as it did in
+// step 1 -- and that is a strong checkpoint rather than a weak one, because
+// every failure mode here is visible. An unwritten buffer is a zero matrix,
+// which collapses all four corners onto the origin and renders nothing. A set
+// pointing at the wrong buffer, a wrong range, or an un-updated set is garbage
+// that flies off screen. The only way back to the same quad is a real identity
+// matrix arriving through a correct buffer, set and binding. The rotation is
+// step 3, where the only remaining variable is the matrix itself.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -357,6 +352,20 @@ private:
     // pays that cost for nothing. The pointers stay valid until vkFreeMemory.
     std::vector<void*> uniformBuffersMapped;
 
+    // The allocator the sets come out of, sized once at creation and unable to
+    // grow -- the same bargain as the command pool, including that its sets are
+    // freed WITH it and never individually.
+    VkDescriptorPool descriptorPool;
+
+    // One set per frame in flight, each permanently pointing at that frame's
+    // uniform buffer. They are not written again after creation: the set holds
+    // the buffer's ADDRESS, and new bytes at that address need no new
+    // descriptor. That is the whole reason this is cheap enough to do per
+    // frame -- the alternative would be rewriting a descriptor every frame.
+    //
+    // No destroy call for these; see descriptorPool above.
+    std::vector<VkDescriptorSet> descriptorSets;
+
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
@@ -450,6 +459,8 @@ private:
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
+        createDescriptorPool();
+        createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1641,6 +1652,127 @@ private:
                   << std::endl;
     }
 
+    // Fixed storage carved at creation, which is why every count has to be
+    // declared up front and why a pool cannot grow. Running out returns
+    // VK_ERROR_OUT_OF_POOL_MEMORY from the allocation rather than growing.
+    //
+    // TWO independent budgets, and conflating them is the easy mistake:
+    // poolSize.descriptorCount is how many DESCRIPTORS of that type the pool
+    // can hand out in total, maxSets is how many SETS. Ten sets of one uniform
+    // buffer each needs 10 and 10; one set holding ten would need 10 and 1.
+    // Exhausting either one fails.
+    void createDescriptorPool() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        // No flags. VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT would
+        // permit vkFreeDescriptorSets on individual sets; without it the only
+        // way to reclaim a set is to destroy or reset the whole pool, which is
+        // all this needs -- the sets live exactly as long as the program.
+        poolInfo.flags = 0;
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr,
+                                   &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+
+        std::cout << "Descriptor pool created:"
+                  << "\n\tcapacity:  " << poolInfo.maxSets << " sets, "
+                  << poolSize.descriptorCount
+                  << " UNIFORM_BUFFER descriptors"
+                  << "\n\tgrowth:    none -- a pool is fixed at creation"
+                  << "\n\tfreeing:   sets are released with the pool, not"
+                     " individually"
+                  << std::endl;
+    }
+
+    // Allocating a set gives it the right SHAPE; it does not point anywhere.
+    // vkUpdateDescriptorSets is what writes the buffer's address in, and it is
+    // worth noticing what it is NOT: not a command, not recorded, not
+    // submitted, no queue. It mutates the set on the host, immediately.
+    //
+    // Which is exactly why a set must not be updated while a command buffer
+    // using it is still pending -- there is no synchronisation primitive
+    // anywhere in that call to protect you. Here each set is written once at
+    // startup and only read afterwards, so the question never arises.
+    void createDescriptorSets() {
+        // Every set uses the SAME layout, but the allocator wants one layout
+        // pointer per set, so the handle is repeated.
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT,
+                                                   descriptorSetLayout);
+
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount =
+            static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        allocInfo.pSetLayouts = layouts.data();
+
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo,
+                                     descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+
+        std::cout << "Descriptor sets allocated: "
+                  << allocInfo.descriptorSetCount << " of "
+                  << MAX_FRAMES_IN_FLIGHT << " the pool allows" << std::endl;
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            // WHICH buffer, and which part of it. range is the size the shader
+            // may read, not the buffer's size -- they coincide here only
+            // because each buffer holds exactly one UBO. VK_WHOLE_SIZE is the
+            // other option. Getting range wrong is not caught: the shader
+            // simply reads a different number of bytes than were written.
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject);
+
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+
+            // Which set, and which binding inside it -- the 0 that shader.vert
+            // writes as `layout(binding = 0)`.
+            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrite.dstBinding = 0;
+
+            // Only meaningful when the binding is an array, which this is not.
+            descriptorWrite.dstArrayElement = 0;
+
+            // Must agree with the layout's descriptorType. Disagreeing is one
+            // of the things validation does catch.
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;
+
+            // Three mutually exclusive payload pointers, one per descriptor
+            // kind: pBufferInfo for buffers, pImageInfo for images and
+            // samplers, pTexelBufferView for texel buffers. The path tracer's
+            // accumulation and output images will use pImageInfo here.
+            descriptorWrite.pBufferInfo = &bufferInfo;
+
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+
+            std::cout << "\tset " << i << ": binding 0 -> buffer "
+                      << reinterpret_cast<const void*>(uniformBuffers[i])
+                      << ", offset " << bufferInfo.offset << ", range "
+                      << bufferInfo.range << " B" << std::endl;
+        }
+
+        std::cout << "\twritten:  on the host by vkUpdateDescriptorSets, no"
+                     " command buffer and no submit"
+                  << "\n\trewrite:  never -- a set holds the ADDRESS, so new"
+                     " bytes there need no new descriptor"
+                  << std::endl;
+    }
+
     void createCommandBuffers() {
         commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
 
@@ -1736,6 +1868,27 @@ private:
         // which then either draws nothing or trips an out-of-bounds read.
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0,
                              VK_INDEX_TYPE_UINT16);
+
+        // The last link in the chain, and command buffer state like the two
+        // bindings above: the pipeline was compiled against the LAYOUT, and
+        // this chooses the contents for this draw.
+        //
+        // pipelineLayout is passed, not the pipeline, and not to bind anything
+        // -- it is the schema the driver checks this set against for
+        // compatibility. The 0 after it is firstSet, the index in the layout's
+        // array of set layouts; the path tracer's second and third sets will
+        // be 1 and 2 here. The trailing 0 and nullptr are dynamic offsets,
+        // which belong to DYNAMIC descriptor types and let one buffer serve
+        // many draws at different offsets -- a real alternative to one buffer
+        // per frame, not taken here.
+        //
+        // Indexed by currentFrame, matching the buffer updateUniformBuffer
+        // just wrote. imageIndex would be wrong: this data belongs to the
+        // frame, not to the swapchain image, exactly as the uniform buffers do.
+        vkCmdBindDescriptorSets(commandBuffer,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipelineLayout, 0, 1,
+                                &descriptorSets[currentFrame], 0, nullptr);
 
         // vkCmdDrawIndexed, not vkCmdDraw. The first count is now the number
         // of INDICES to walk, not vertices to fetch -- 6 here, from a pool of
@@ -2488,6 +2641,12 @@ private:
         // buffers, so nothing recorded still refers to a framebuffer or
         // pipeline destroyed below. Command buffers need no call of their own.
         vkDestroyCommandPool(device, commandPool, nullptr);
+
+        // Before the uniform buffers below, because the sets inside it hold
+        // those buffers' addresses -- the file's rule is that a reference dies
+        // before its target. Destroying the pool frees every set in it, so the
+        // descriptorSets handles need no calls of their own.
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
         // Buffer before its memory, and both after the pool: from step 2b a
         // recorded command buffer refers to this buffer, and freeing memory
