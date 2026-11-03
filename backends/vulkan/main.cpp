@@ -1,31 +1,40 @@
 // Vulkan backend entry point.
 //
-// Phase 4, step 2 -- vulkan-tutorial.com "Descriptor pool and sets":
-// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_pool_and_sets
+// Phase 4, step 3 -- vulkan-tutorial.com "Descriptor layout and buffer",
+// its "Updating uniform data" section:
+// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_layout_and_buffer
 //
-// Step 1 left a schema and a buffer with nothing joining them. Three things
-// close the gap, and they are deliberately three separate mechanisms:
+// PHASE 4 COMPLETE. Steps 1 and 2 built the descriptor chain and proved it
+// carried an identity matrix without changing a single pixel. The only
+// variable left is the matrix itself, so this step changes two lines of
+// updateUniformBuffer and the quad rotates. Nothing about descriptors changes
+// here at all -- the set still holds the same address, and new bytes at that
+// address need no new descriptor, which is the property that makes per-frame
+// uniform data cheap.
 //
-//   createDescriptorPool    the allocator, sized up front and unable to grow
-//   createDescriptorSets    allocates the sets, then vkUpdateDescriptorSets
-//                           writes the buffer's address INTO each one -- on
-//                           the host, immediately, with no command buffer
-//   recordCommandBuffer     vkCmdBindDescriptorSets, per frame, alongside the
-//                           vertex and index buffer bindings
+// Three traps in it, none of them about descriptors:
 //
-// shader.vert now declares `layout(binding = 0) uniform ... ubo` and
-// multiplies gl_Position by ubo.model. That completes the chain this phase
-// exists to teach: a shader reaching memory by itself rather than being handed
-// attributes by fixed-function hardware.
+//   1. Drive the angle from ELAPSED TIME, never from a frame counter. A
+//      frame-driven angle makes rotation speed a function of framerate --
+//      half speed when the window is occluded, double on a 240 Hz display.
+//      This is why std::chrono appears in a graphics tutorial at all.
+//   2. steady_clock, not the tutorial's high_resolution_clock, which is
+//      permitted to alias system_clock and can therefore jump BACKWARDS when
+//      the system clock is adjusted. reportFrameTiming already uses
+//      steady_clock, so the file also keeps one clock.
+//   3. Rotate about Z, which is the only safe axis here. A rotation in the
+//      screen plane preserves winding order, so the quad survives
+//      FRONT_FACE_CLOCKWISE back-face culling throughout. About X or Y it
+//      would turn edge-on, present its back face and VANISH for half of every
+//      revolution, with no error reported -- a culling bug wearing the costume
+//      of a rotation bug.
 //
-// The matrix is still identity, so the quad must look EXACTLY as it did in
-// step 1 -- and that is a strong checkpoint rather than a weak one, because
-// every failure mode here is visible. An unwritten buffer is a zero matrix,
-// which collapses all four corners onto the origin and renders nothing. A set
-// pointing at the wrong buffer, a wrong range, or an un-updated set is garbage
-// that flies off screen. The only way back to the same quad is a real identity
-// matrix arriving through a correct buffer, set and binding. The rotation is
-// step 3, where the only remaining variable is the matrix itself.
+// Which way it appears to turn is Vulkan's y-down convention, not arithmetic.
+// OBSERVED, by watching it: a positive angle about +Z reads as CLOCKWISE on
+// screen. That is the opposite of the counter-clockwise the same call gives in
+// a right-handed y-up system, and Vulkan's inverted Y is the reason. Recorded
+// from observation rather than derived, per the Phase 3 winding lesson -- the
+// derivation agreed this time, which is not a reason to trust the next one.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -40,9 +49,15 @@
 #define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
 
+// glm::rotate and the rest of the transform constructors -- glm keeps the base
+// types and the matrix builders in separate headers. Declared here rather than
+// with the camera in Phase 6 because the rotation below is the first caller.
+#include <glm/gtc/matrix_transform.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -407,6 +422,12 @@ private:
     uint32_t frameCounter = 0;
     std::chrono::steady_clock::time_point frameWindowStart;
 
+    // t = 0 for the rotation. Set at the end of initVulkan rather than at
+    // construction, so the several hundred milliseconds of device and pipeline
+    // setup do not count as elapsed animation time and the first frame starts
+    // at an angle of zero.
+    std::chrono::steady_clock::time_point startTime;
+
     void initWindow() {
         glfwInit();
 
@@ -463,6 +484,8 @@ private:
         createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
+
+        startTime = std::chrono::steady_clock::now();
     }
 
     void createInstance() {
@@ -2434,15 +2457,33 @@ private:
     // is the classic uniform-buffer bug, and HOST_COHERENT memory makes it
     // silent -- the frame in flight simply uses whatever landed mid-read.
     //
-    // Identity, deliberately. Step 2 binds this buffer to the shader and the
-    // quad must then look EXACTLY as it does now; a rotation introduced in the
-    // same step would make "the plumbing works" and "the matrix is animating"
-    // indistinguishable, which is precisely how a bound-but-never-updated
-    // descriptor hides. The time-based rotation is step 3, a small change on
-    // top of a known-good reference.
+    // Steps 1 and 2 wrote identity here, so that binding the buffer to the
+    // shader could be checked against an unchanged picture. That reference is
+    // established, so the matrix becomes the only moving part.
     void updateUniformBuffer(uint32_t currentImage) {
+        // Seconds since initVulkan finished, as a float. The ratio template
+        // argument is what makes the unit seconds rather than the clock's own
+        // tick period; counting ticks and dividing by hand is where this
+        // usually goes wrong.
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(
+                         std::chrono::steady_clock::now() - startTime)
+                         .count();
+
         UniformBufferObject ubo{};
-        ubo.model = glm::mat4(1.0f);
+
+        // 90 degrees per second, about Z. glm::radians rather than a literal
+        // because GLM_FORCE_RADIANS is set at the top of this file: passing
+        // 90.0f directly would mean 90 RADIANS, about 14.3 revolutions a
+        // second, which looks like a flickering mess rather than like an
+        // error.
+        //
+        // The first argument is the matrix being rotated, not the result --
+        // glm::rotate multiplies, so identity here means "a pure rotation".
+        // Z is the axis pointing into the screen, so this is a spin in the
+        // screen plane; see the note at the top of the file on why no other
+        // axis would stay visible under back-face culling.
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
+                                glm::vec3(0.0f, 0.0f, 1.0f));
 
         // No flush call, because the memory is HOST_COHERENT: this write is
         // visible to the GPU by the time the submit below happens. Drop
@@ -2451,21 +2492,36 @@ private:
         // hazard again, in the one place it is easiest to forget.
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
 
-        // Evidence for a checkpoint with nothing to look at, then silence.
-        // The write is proved by reading the bytes back THROUGH the mapping --
-        // which is itself what host-visible memory means -- and the per-frame
-        // claim by watching the slot alternate 0, 1, 0 over the first frames.
-        // frameCounter is still 0 on the first drawFrame; reportFrameTiming
-        // increments it at the end of the frame.
-        if (frameCounter <= MAX_FRAMES_IN_FLIGHT) {
+        // The rotation is visible now, so this print stops being the only
+        // evidence and becomes the ANALYTIC half of the checkpoint: a time
+        // series that says whether the animation is really time-driven.
+        //
+        // Two things are checkable from it without looking at the window.
+        // The angle must track t at 90 deg/s -- a frame-driven angle would
+        // drift away from that the moment the framerate moved. And the top-left
+        // 2x2 must read (cos, sin) of that angle, which is what distinguishes a
+        // genuine rotation matrix from a scale, a shear, or a stale buffer.
+        //
+        // The first frames plus every 200th, matching reportFrameTiming's
+        // cadence. frameCounter is still 0 on the first drawFrame; it is
+        // incremented at the END of the frame.
+        if (frameCounter <= MAX_FRAMES_IN_FLIGHT || frameCounter % 200 == 0) {
+            // Read back THROUGH the mapping rather than from the local ubo,
+            // so what is reported is what the GPU will actually see.
             const UniformBufferObject* readBack =
                 static_cast<const UniformBufferObject*>(
                     uniformBuffersMapped[currentImage]);
-            std::cout << "Uniform write: slot " << currentImage << " at "
-                      << uniformBuffersMapped[currentImage] << ", "
-                      << sizeof(ubo) << " B, read back model[0][0] = "
-                      << readBack->model[0][0] << ", model[3][3] = "
-                      << readBack->model[3][3] << std::endl;
+
+            std::streamsize prec = std::cout.precision();
+            std::cout << std::fixed << std::setprecision(3)
+                      << "Uniform write: slot " << currentImage << ", t = "
+                      << time << " s, angle "
+                      << std::fmod(time * 90.0f, 360.0f) << " deg"
+                      << ", model[0][0] = " << readBack->model[0][0]
+                      << ", model[0][1] = " << readBack->model[0][1]
+                      << std::endl;
+            std::cout.unsetf(std::ios::fixed);
+            std::cout.precision(prec);
         }
     }
 
