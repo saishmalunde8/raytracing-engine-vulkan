@@ -1,40 +1,72 @@
 // Vulkan backend entry point.
 //
-// Phase 4, step 3 -- vulkan-tutorial.com "Descriptor layout and buffer",
-// its "Updating uniform data" section:
-// https://vulkan-tutorial.com/Uniform_buffers/Descriptor_layout_and_buffer
+// Phase 5, step 1 -- vulkan-tutorial.com "Images":
+// https://vulkan-tutorial.com/Texture_mapping/Images
 //
-// PHASE 4 COMPLETE. Steps 1 and 2 built the descriptor chain and proved it
-// carried an identity matrix without changing a single pixel. The only
-// variable left is the matrix itself, so this step changes two lines of
-// updateUniformBuffer and the quad rotates. Nothing about descriptors changes
-// here at all -- the set still holds the same address, and new bytes at that
-// address need no new descriptor, which is the property that makes per-frame
-// uniform data cheap.
+// The first VkImage this backend creates itself. Every image so far came from
+// the swapchain already allocated, already sized and already in a layout the
+// presentation engine chose. This one is ours end to end, which means meeting
+// the two things that make an image not simply a buffer with a width.
 //
-// Three traps in it, none of them about descriptors:
+// The first is TILING. A buffer is a 1-D array and the GPU reads it linearly.
+// An image is read in 2-D neighbourhoods -- adjacent screen pixels sample
+// adjacent texels -- so the hardware stores it swizzled, with texels that are
+// close in 2-D close in memory. That arrangement is vendor-private and
+// undocumented. TILING_OPTIMAL means "the driver's secret layout, fast to
+// sample, impossible to memcpy into"; TILING_LINEAR means "row-major, you may
+// write it, slow to sample". So the upload is staged, for a STRONGER reason
+// than the vertex buffer's: that one staged because device-local memory is
+// unmappable, and on this unified-memory hardware the locality it bought was
+// notional. This one stages because the destination's byte layout is a
+// secret. vkCmdCopyBufferToImage is the call that performs the swizzle, and
+// there is no way to do its job from the host at any tiling but LINEAR.
 //
-//   1. Drive the angle from ELAPSED TIME, never from a frame counter. A
-//      frame-driven angle makes rotation speed a function of framerate --
-//      half speed when the window is occluded, double on a 240 Hz display.
-//      This is why std::chrono appears in a graphics tutorial at all.
-//   2. steady_clock, not the tutorial's high_resolution_clock, which is
-//      permitted to alias system_clock and can therefore jump BACKWARDS when
-//      the system clock is adjusted. reportFrameTiming already uses
-//      steady_clock, so the file also keeps one clock.
-//   3. Rotate about Z, which is the only safe axis here. A rotation in the
-//      screen plane preserves winding order, so the quad survives
-//      FRONT_FACE_CLOCKWISE back-face culling throughout. About X or Y it
-//      would turn edge-on, present its back face and VANISH for half of every
-//      revolution, with no error reported -- a culling bug wearing the costume
-//      of a rotation bug.
+// The second is LAYOUT, which has no buffer analogue at all. The same image
+// memory has to be physically arranged differently depending on what is about
+// to touch it: optimal-for-being-copied-into is not optimal-for-being-sampled
+// is not optimal-for-being-presented. So a VkImage carries a layout as part
+// of its live state and it is changed explicitly, by a pipeline barrier that
+// does two jobs in one call -- the rearrangement, and the dependency saying
+// every write before it must complete and become visible before any read
+// after it.
 //
-// Which way it appears to turn is Vulkan's y-down convention, not arithmetic.
-// OBSERVED, by watching it: a positive angle about +Z reads as CLOCKWISE on
-// screen. That is the opposite of the counter-clockwise the same call gives in
-// a right-handed y-up system, and Vulkan's inverted Y is the reason. Recorded
-// from observation rather than derived, per the Phase 3 winding lesson -- the
-// derivation agreed this time, which is not a reason to trust the next one.
+// Four transitions happen here. Two are the upload:
+//
+//   UNDEFINED -> TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
+//
+// and two more take it to TRANSFER_SRC_OPTIMAL and back, to copy the pixels
+// to the host and check them. Those two exist for the checkpoint, and they
+// demonstrate what a one-way upload hides: a layout describes this moment,
+// not the image. You transition back.
+//
+// Three traps:
+//
+//   1. UNDEFINED as the OLD layout means "discard the contents". That is
+//      correct and free for the first transition, where there is nothing to
+//      keep. Reach for it again after the copy and the uploaded pixels are
+//      legally thrown away, with nothing reported.
+//   2. The four mask fields are the real content of a barrier -- stages say
+//      WHEN, access masks say WHAT KIND OF TOUCH. Wrong values usually work
+//      anyway on forgiving hardware, which is what makes this the bug that
+//      ships and then fails on somebody else's GPU.
+//   3. initialLayout has exactly two useful values and PREINITIALIZED is not
+//      the one here: it claims data was already written through a linear
+//      mapping. Nothing was.
+//
+// Deliberate deviation: the tutorial loads a JPEG with stb_image. This
+// generates a checkerboard on the CPU instead. The Vulkan path is identical
+// byte for byte -- staging buffer, two transitions, copy -- while stbi_load
+// teaches stb_image and not Vulkan, needs a third-party header, and would put
+// a binary asset in a repo whose rules only cover backends/vulkan/ and
+// shaders/. It also buys a checkpoint worth having: the expected pixels are
+// computable, so the upload is checked against them exactly rather than by
+// asking whether the screen looks like a photograph.
+//
+// Also here, and the tutorial's own refactor on this page:
+// beginSingleTimeCommands/endSingleTimeCommands, lifted out of copyBuffer.
+// Every one-off GPU operation outside the render loop needs the same
+// allocate/begin/end/submit/wait/free envelope and only the commands in the
+// middle differ. copyBuffer was the only caller; there are five now.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -381,6 +413,22 @@ private:
     // No destroy call for these; see descriptorPool above.
     std::vector<VkDescriptorSet> descriptorSets;
 
+    // Phase 5 step 1. Created, filled and parked in SHADER_READ_ONLY_OPTIMAL.
+    // Nothing reads it yet and nothing can: a VkImage is storage plus a
+    // layout, and it takes the view in step 2 to make it readable at all.
+    // Being in a shader-read layout that no shader asks about is not a
+    // contradiction -- a layout is a promise about arrangement, not a
+    // subscription.
+    VkImage textureImage;
+    VkDeviceMemory textureImageMemory;
+
+    // Fixed here rather than read out of a file header, which is the one real
+    // consequence of generating the texture instead of loading it. 256/32 = 8
+    // squares a side, every boundary on an exact texel, and squares big enough
+    // to count by eye once step 3 puts them on the quad.
+    static const uint32_t TEXTURE_SIZE = 256;
+    static const uint32_t TEXTURE_CHECKER_SQUARE = 32;
+
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
@@ -477,6 +525,10 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
+
+        // After the pool, which its transitions and copies submit through.
+        createTextureImage();
+
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -1383,12 +1435,11 @@ private:
                   << memoryPropertyString(chosen.propertyFlags) << std::endl;
     }
 
-    // Copying between two GPU buffers is WORK THE GPU DOES, unlike the
-    // map/memcpy in createVertexBuffer which is pure CPU. So it needs a
-    // command buffer, a queue submission and a wait -- the first submission
-    // this backend makes outside the render loop.
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
-                    VkDeviceSize size) {
+    // The envelope every one-off GPU operation outside the render loop needs.
+    // Was inline in copyBuffer when copyBuffer was the only such operation;
+    // step 1 of Phase 5 brings the count to five, so it moves out here. Only
+    // the commands recorded between the two calls differ.
+    VkCommandBuffer beginSingleTimeCommands() {
         // Reuses the render loop's pool. A separate short-lived pool created
         // with TRANSIENT_BIT would let the driver optimise for throwaway
         // buffers, which is the refinement the tutorial mentions and this
@@ -1412,15 +1463,10 @@ private:
 
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-        // Offsets into source and destination, both zero here. They are what
-        // make it possible to copy one mesh into the middle of a shared
-        // buffer rather than a buffer of its own.
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = size;
-        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        return commandBuffer;
+    }
 
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
         vkEndCommandBuffer(commandBuffer);
 
         VkSubmitInfo submitInfo{};
@@ -1443,6 +1489,455 @@ private:
         vkQueueWaitIdle(graphicsAndComputeQueue);
 
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    // Copying between two GPU buffers is WORK THE GPU DOES, unlike the
+    // map/memcpy in createVertexBuffer which is pure CPU. So it needs a
+    // command buffer, a queue submission and a wait -- the first submission
+    // this backend made outside the render loop, and now one of several.
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                    VkDeviceSize size) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // Offsets into source and destination, both zero here. They are what
+        // make it possible to copy one mesh into the middle of a shared
+        // buffer rather than a buffer of its own.
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0;
+        copyRegion.dstOffset = 0;
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    static std::string imageLayoutString(VkImageLayout layout) {
+        switch (layout) {
+            case VK_IMAGE_LAYOUT_UNDEFINED:
+                return "UNDEFINED";
+            case VK_IMAGE_LAYOUT_GENERAL:
+                return "GENERAL";
+            case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                return "TRANSFER_DST_OPTIMAL";
+            case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                return "TRANSFER_SRC_OPTIMAL";
+            case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                return "SHADER_READ_ONLY_OPTIMAL";
+            case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+                return "PRESENT_SRC_KHR";
+            default:
+                return "layout " + std::to_string(static_cast<int>(layout));
+        }
+    }
+
+    // The image counterpart of createBuffer, and deliberately the same shape:
+    // the leading parameters are what differs between one image and the next,
+    // image and imageMemory are outputs, label exists so the allocation can
+    // report which memory type it landed on.
+    void createImage(uint32_t width, uint32_t height, VkFormat format,
+                     VkImageTiling tiling, VkImageUsageFlags usage,
+                     VkMemoryPropertyFlags properties, VkImage& image,
+                     VkDeviceMemory& imageMemory, const std::string& label) {
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+
+        // depth is 1 for a 2-D image, not 0. Vulkan models 1-D, 2-D and 3-D
+        // images with one extent, and an extent of zero in any dimension the
+        // imageType uses is invalid -- so the flat image is one texel deep
+        // rather than zero texels deep.
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        imageInfo.extent.depth = 1;
+
+        // No mip chain and no array. Generating Mipmaps is one of the chapters
+        // this project skips: a path tracer samples along rays rather than
+        // across a surface at a known screen-space derivative, so the level of
+        // detail a mip chain selects has nothing to select from.
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+
+        imageInfo.format = format;
+        imageInfo.tiling = tiling;
+
+        // UNDEFINED, not PREINITIALIZED. The difference is a claim about
+        // whether data is already in there: PREINITIALIZED promises the host
+        // wrote some through a linear mapping and must be preserved, which is
+        // only meaningful at TILING_LINEAR and is false here. UNDEFINED says
+        // the contents are garbage and may be discarded, which is what lets
+        // the first transition below be free.
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        // What it is FOR, checked against how it is used, exactly as with a
+        // buffer. An image sampled by a shader that was never created with
+        // SAMPLED_BIT is a validation error, not a slow path.
+        imageInfo.usage = usage;
+
+        // Same reasoning as the swapchain's and the buffers': one
+        // graphics+compute family touches everything, so no ownership
+        // transfer is needed.
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        // One sample per texel. Multisampling is another skipped chapter --
+        // the path tracer antialiases by jittering rays inside the pixel,
+        // which is a better answer to the same problem and costs no extra
+        // image memory.
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image: " + label);
+        }
+
+        // Same two-step as a buffer: the handle above is a description with no
+        // storage behind it, and only the driver knows what memory can back
+        // it. The size it reports is reliably LARGER than width*height*4 for
+        // a tiled image, because the swizzle pads -- which is the most direct
+        // evidence that TILING_OPTIMAL is not row-major.
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex =
+            findMemoryType(memRequirements.memoryTypeBits, properties);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate memory for: " +
+                                     label);
+        }
+
+        vkBindImageMemory(device, image, imageMemory, 0);
+
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+        const VkMemoryType& chosen =
+            memProperties.memoryTypes[allocInfo.memoryTypeIndex];
+
+        std::cout << label << ": " << width << "x" << height << ", "
+                  << (static_cast<size_t>(width) * height * 4)
+                  << " B of pixel data"
+                  << "\n\ttiling:    "
+                  << (tiling == VK_IMAGE_TILING_OPTIMAL ? "OPTIMAL"
+                                                        : "LINEAR")
+                  << "\n\tallocated: " << memRequirements.size
+                  << " B, alignment " << memRequirements.alignment << " B"
+                  << "\n\tchose:     type " << allocInfo.memoryTypeIndex
+                  << " on heap " << chosen.heapIndex << ", "
+                  << memoryPropertyString(chosen.propertyFlags) << std::endl;
+    }
+
+    // A layout transition is GPU work -- the driver may genuinely rearrange
+    // bytes -- so it is a recorded command, not a host call. The vehicle is a
+    // pipeline barrier, which is doing two separable jobs at once: changing
+    // the layout, and establishing a dependency between what came before and
+    // what comes after.
+    //
+    // No format parameter, which the tutorial has and does not use at this
+    // point. It is there for depth images, whose aspectMask has to name depth
+    // and possibly stencil instead of colour; Depth buffering is a skipped
+    // chapter, so taking an argument that is ignored would be a worse comment
+    // than this one.
+    void transitionImageLayout(VkImage image, VkImageLayout oldLayout,
+                               VkImageLayout newLayout) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+
+        // Used only by a QUEUE FAMILY OWNERSHIP transfer, which this is not.
+        // The sentinel is required: leaving these zeroed would name family 0
+        // and request a transfer to itself.
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        // The four fields that are the actual content of the barrier. Stages
+        // say WHEN the dependency applies, access masks say WHAT KIND of
+        // memory access is being ordered. Wrong values here very often work
+        // on desktop hardware anyway, which is precisely what makes this the
+        // defect that ships.
+        VkPipelineStageFlags sourceStage;
+        VkPipelineStageFlags destinationStage;
+
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            // Nothing wrote this image before now, so there is nothing to
+            // wait for and nothing to flush: access 0 at the top of the pipe.
+            // The copy that follows is what must be held back until the
+            // rearrangement is done, hence TRANSFER on the far side.
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+                   newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            // The real one. The copy's writes must complete AND become
+            // visible to shader reads; naming the fragment stage is what lets
+            // everything earlier in the pipeline carry on regardless.
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+                   newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            // Verification only, and the direction that proves a layout is a
+            // statement about the present rather than a property of the image.
+            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+                   newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else {
+            // Throwing beats guessing. An unlisted pair is a transition
+            // nobody reasoned about, and the masks are not derivable from the
+            // layouts -- they depend on what the surrounding code does.
+            throw std::runtime_error("unsupported layout transition: " +
+                                     imageLayoutString(oldLayout) + " -> " +
+                                     imageLayoutString(newLayout));
+        }
+
+        // The one command. The two zero/nullptr pairs after the stages are
+        // memory barriers and buffer barriers -- the same call orders all
+        // three kinds of resource, and this uses only the image form.
+        vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0,
+                             0, nullptr, 0, nullptr, 1, &barrier);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // The swizzle. This is the only way tiled pixel data gets written, and
+    // the reason the host-side path stops at a buffer.
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width,
+                           uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+
+        // Zero means TIGHTLY PACKED, not "no rows". They exist for copying a
+        // sub-rectangle out of a larger host image, where the source stride
+        // and the copied width differ.
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {width, height, 1};
+
+        // The layout is passed again even though the image is already in it:
+        // the command needs to know what arrangement to expect, and it is
+        // taken on trust. Naming a layout the image is not actually in is a
+        // validation error and, unchecked, garbage.
+        vkCmdCopyBufferToImage(commandBuffer, buffer, image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &region);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // Row-major RGBA8, which is what a staging buffer wants. Two colours far
+    // enough apart to be unmistakable on screen in step 3 and trivially
+    // distinguishable as bytes here.
+    static std::vector<uint8_t> generateCheckerboard(uint32_t size,
+                                                     uint32_t square) {
+        std::vector<uint8_t> pixels(static_cast<size_t>(size) * size * 4);
+
+        for (uint32_t y = 0; y < size; y++) {
+            for (uint32_t x = 0; x < size; x++) {
+                bool magenta = ((x / square) + (y / square)) % 2 == 0;
+                size_t i = (static_cast<size_t>(y) * size + x) * 4;
+                pixels[i + 0] = magenta ? 255 : 0;
+                pixels[i + 1] = magenta ? 0 : 128;
+                pixels[i + 2] = magenta ? 255 : 128;
+                pixels[i + 3] = 255;
+            }
+        }
+
+        return pixels;
+    }
+
+    void createTextureImage() {
+        std::vector<uint8_t> pixels =
+            generateCheckerboard(TEXTURE_SIZE, TEXTURE_CHECKER_SQUARE);
+        VkDeviceSize imageSize = pixels.size();
+
+        // Host-visible and mappable, exactly as the vertex buffer's staging
+        // buffer was. The difference is downstream: that copy went
+        // buffer-to-buffer and preserved the byte order, this one goes
+        // buffer-to-image and rearranges it.
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer, stagingBufferMemory,
+                     "Texture staging buffer");
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+        memcpy(data, pixels.data(), static_cast<size_t>(imageSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // TRANSFER_SRC_BIT is here for the checkpoint below and nothing else
+        // -- the rendering path only ever needs DST (to receive the upload)
+        // and SAMPLED (to be read in step 3). Said plainly because a usage
+        // flag added for verification is exactly the kind of thing that later
+        // looks load-bearing.
+        createImage(TEXTURE_SIZE, TEXTURE_SIZE, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage,
+                    textureImageMemory, "Texture image");
+
+        transitionImageLayout(textureImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copyBufferToImage(stagingBuffer, textureImage, TEXTURE_SIZE,
+                          TEXTURE_SIZE);
+
+        // The resting state. Nothing samples it until step 3; parking it here
+        // means step 3 adds a descriptor and a shader line and no transition.
+        transitionImageLayout(textureImage,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        // Safe only because endSingleTimeCommands waited for the queue to
+        // drain. Freeing this while the copy was still in flight would be a
+        // use-after-free the GPU commits rather than the CPU.
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+        verifyTextureUpload(pixels);
+    }
+
+    // Pulls an image's pixels back to the host, leaving it in the layout it
+    // was found in. Written as a helper on its first use because step 5 needs
+    // the identical operation on the storage image, where it is the whole
+    // checkpoint: proving a compute dispatch wrote the right values at the
+    // right coordinates is not something the screen can show.
+    std::vector<uint8_t> readbackImage(VkImage image, uint32_t width,
+                                       uint32_t height,
+                                       VkImageLayout currentLayout) {
+        VkDeviceSize size = static_cast<VkDeviceSize>(width) * height * 4;
+
+        VkBuffer dstBuffer;
+        VkDeviceMemory dstMemory;
+        createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     dstBuffer, dstMemory, "Readback buffer");
+
+        transitionImageLayout(image, currentLayout,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {width, height, 1};
+
+        // The inverse of copyBufferToImage, and it UNDOES the swizzle: what
+        // lands in the buffer is row-major again, which is the only reason
+        // comparing it against the generated pixels means anything.
+        vkCmdCopyImageToBuffer(commandBuffer, image,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstBuffer,
+                               1, &region);
+
+        endSingleTimeCommands(commandBuffer);
+
+        // Back where it came from, so a caller cannot be broken by having been
+        // measured.
+        transitionImageLayout(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              currentLayout);
+
+        std::vector<uint8_t> out(static_cast<size_t>(size));
+        void* mapped;
+        vkMapMemory(device, dstMemory, 0, size, 0, &mapped);
+        memcpy(out.data(), mapped, static_cast<size_t>(size));
+        vkUnmapMemory(device, dstMemory);
+
+        vkDestroyBuffer(device, dstBuffer, nullptr);
+        vkFreeMemory(device, dstMemory, nullptr);
+
+        return out;
+    }
+
+    // The checkpoint. Without this the step's only evidence is that nothing
+    // crashed, which would be true of an image full of zeroes, an image whose
+    // rows came back shifted by the tiling, and an image the copy never
+    // reached. All three are silent, and none of them is visible until step 3
+    // puts the thing on screen -- by which point a wrong texture and a wrong
+    // sampler look alike.
+    void verifyTextureUpload(const std::vector<uint8_t>& expected) {
+        std::vector<uint8_t> actual = readbackImage(
+            textureImage, TEXTURE_SIZE, TEXTURE_SIZE,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        size_t mismatches = 0;
+        size_t firstMismatch = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            if (actual[i] != expected[i]) {
+                if (mismatches == 0) {
+                    firstMismatch = i;
+                }
+                mismatches++;
+            }
+        }
+
+        std::cout << "Texture upload verified by readback:"
+                  << "\n\tbytes compared: " << expected.size()
+                  << "\n\tmismatches:     " << mismatches;
+        if (mismatches > 0) {
+            std::cout << " (first at byte " << firstMismatch << ")";
+        }
+
+        // Four texels either side of a square boundary. A whole-image compare
+        // already covers these; printing them makes the failure legible rather
+        // than a count, and shows the checkerboard really is a checkerboard
+        // and not one flat colour that happens to match everywhere.
+        const uint32_t probes[4][2] = {{0, 0}, {31, 0}, {32, 0}, {255, 255}};
+        for (const auto& p : probes) {
+            size_t i =
+                (static_cast<size_t>(p[1]) * TEXTURE_SIZE + p[0]) * 4;
+            std::cout << "\n\ttexel (" << p[0] << "," << p[1] << "):  rgba "
+                      << static_cast<int>(actual[i + 0]) << ","
+                      << static_cast<int>(actual[i + 1]) << ","
+                      << static_cast<int>(actual[i + 2]) << ","
+                      << static_cast<int>(actual[i + 3]);
+        }
+        std::cout << std::endl;
+
+        if (mismatches > 0) {
+            throw std::runtime_error(
+                "texture readback does not match the generated pixels");
+        }
     }
 
     void createVertexBuffer() {
@@ -2712,6 +3207,12 @@ private:
 
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
+
+        // Image before its memory, the same rule as a buffer. Nothing refers
+        // to it in this step; from step 3 a descriptor set will, and that set
+        // dies with the pool destroyed above.
+        vkDestroyImage(device, textureImage, nullptr);
+        vkFreeMemory(device, textureImageMemory, nullptr);
 
         // The same pair once per frame in flight. No vkUnmapMemory call:
         // vkFreeMemory unmaps implicitly, and uniformBuffersMapped holds
