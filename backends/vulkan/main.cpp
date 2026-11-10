@@ -1,72 +1,63 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 1 -- vulkan-tutorial.com "Images":
-// https://vulkan-tutorial.com/Texture_mapping/Images
+// Phase 5, step 2 -- vulkan-tutorial.com "Image view and sampler":
+// https://vulkan-tutorial.com/Texture_mapping/Image_view_and_sampler
 //
-// The first VkImage this backend creates itself. Every image so far came from
-// the swapchain already allocated, already sized and already in a layout the
-// presentation engine chose. This one is ours end to end, which means meeting
-// the two things that make an image not simply a buffer with a width.
+// Two objects, neither of which changes a pixel. Step 1 left a filled image
+// in SHADER_READ_ONLY_OPTIMAL that nothing could read, because nothing reads
+// a VkImage: shaders and framebuffers bind a VIEW. The image is STORAGE; the
+// view is an INTERPRETATION of it -- which mip levels, which array layers,
+// colour or depth aspect, read as what type, with what channel remapping. One
+// image can carry several views at once: a cube map seen as six 2-D layers, a
+// mip chain seen as one level, an RGBA image seen with red broadcast to every
+// channel. createImageViews already did this for the swapchain in Phase 2, so
+// the code here is extracted rather than written, and createImageView now
+// serves both callers.
 //
-// The first is TILING. A buffer is a 1-D array and the GPU reads it linearly.
-// An image is read in 2-D neighbourhoods -- adjacent screen pixels sample
-// adjacent texels -- so the hardware stores it swizzled, with texels that are
-// close in 2-D close in memory. That arrangement is vendor-private and
-// undocumented. TILING_OPTIMAL means "the driver's secret layout, fast to
-// sample, impossible to memcpy into"; TILING_LINEAR means "row-major, you may
-// write it, slow to sample". So the upload is staged, for a STRONGER reason
-// than the vertex buffer's: that one staged because device-local memory is
-// unmappable, and on this unified-memory hardware the locality it bought was
-// notional. This one stages because the destination's byte layout is a
-// secret. vkCmdCopyBufferToImage is the call that performs the swizzle, and
-// there is no way to do its job from the host at any tiling but LINEAR.
+// The sampler is the one that catches people out. In OpenGL, filtering and
+// wrapping were state ON the texture. A VkSampler is a wholly separate object
+// that references no image at all -- just a bundle of rules: how to blend
+// texels when magnifying, when minifying, what happens outside [0,1], how to
+// choose mip levels. They are separate because the pairing is many-to-many.
+// 500 textures and 3 sampling policies is 503 objects rather than 1500, and
+// one shader can read the same image through two samplers in a single draw,
+// one clamping and one repeating.
 //
-// The second is LAYOUT, which has no buffer analogue at all. The same image
-// memory has to be physically arranged differently depending on what is about
-// to touch it: optimal-for-being-copied-into is not optimal-for-being-sampled
-// is not optimal-for-being-presented. So a VkImage carries a layout as part
-// of its live state and it is changed explicitly, by a pipeline barrier that
-// does two jobs in one call -- the rearrangement, and the dependency saying
-// every write before it must complete and become visible before any read
-// after it.
-//
-// Four transitions happen here. Two are the upload:
-//
-//   UNDEFINED -> TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL
-//
-// and two more take it to TRANSFER_SRC_OPTIMAL and back, to copy the pixels
-// to the host and check them. Those two exist for the checkpoint, and they
-// demonstrate what a one-way upload hides: a layout describes this moment,
-// not the image. You transition back.
+// magFilter is the only choice here with a visible consequence, and it lands
+// in step 3: NEAREST takes the single closest texel and gives razor-sharp
+// square edges, LINEAR blends the four surrounding ones and softens every
+// boundary. On a 256x256 checkerboard stretched across the quad the
+// difference is unmistakable, which is what makes it a good thing to have
+// chosen deliberately before the first time anything is on screen.
 //
 // Three traps:
 //
-//   1. UNDEFINED as the OLD layout means "discard the contents". That is
-//      correct and free for the first transition, where there is nothing to
-//      keep. Reach for it again after the copy and the uploaded pixels are
-//      legally thrown away, with nothing reported.
-//   2. The four mask fields are the real content of a barrier -- stages say
-//      WHEN, access masks say WHAT KIND OF TOUCH. Wrong values usually work
-//      anyway on forgiving hardware, which is what makes this the bug that
-//      ships and then fails on somebody else's GPU.
-//   3. initialLayout has exactly two useful values and PREINITIALIZED is not
-//      the one here: it claims data was already written through a linear
-//      mapping. Nothing was.
+//   1. anisotropyEnable = VK_TRUE is not free. It needs the samplerAnisotropy
+//      DEVICE FEATURE, enabled back at device creation, and maxAnisotropy
+//      clamped to maxSamplerAnisotropy, which has to be queried. See the
+//      deviation below.
+//   2. unnormalizedCoordinates switches texture coordinates between [0,1) and
+//      [0,width). VK_FALSE is nearly always right, and it is what makes a
+//      shader independent of the texture's resolution.
+//   3. CLAMP_TO_BORDER needs borderColor set, and without an extension that
+//      field accepts a handful of enum values rather than an arbitrary colour.
 //
-// Deliberate deviation: the tutorial loads a JPEG with stb_image. This
-// generates a checkerboard on the CPU instead. The Vulkan path is identical
-// byte for byte -- staging buffer, two transitions, copy -- while stbi_load
-// teaches stb_image and not Vulkan, needs a third-party header, and would put
-// a binary asset in a repo whose rules only cover backends/vulkan/ and
-// shaders/. It also buys a checkpoint worth having: the expected pixels are
-// computable, so the upload is checked against them exactly rather than by
-// asking whether the screen looks like a photograph.
+// Deliberate deviation: anisotropyEnable stays VK_FALSE, where the tutorial
+// turns it on. Anisotropic filtering corrects blur when a TEXTURED SURFACE is
+// seen at a grazing angle, so the pixel's footprint in texture space is a long
+// thin ellipse instead of a circle. That is a rasterisation concern about
+// surface textures. Step 7 displays a compute-generated image full-screen at
+// essentially 1:1, where the footprint IS a circle and there is nothing to
+// correct. Enabling it would mean reaching back into Phase 1 to turn on a
+// device feature, adding a support check to isDeviceSuitable and querying a
+// limit, for an effect this renderer never uses -- and a feature enabled but
+// unused is not always free. The limit is printed anyway, so what was declined
+// is visible rather than merely absent.
 //
-// Also here, and the tutorial's own refactor on this page:
-// beginSingleTimeCommands/endSingleTimeCommands, lifted out of copyBuffer.
-// Every one-off GPU operation outside the render loop needs the same
-// allocate/begin/end/submit/wait/free envelope and only the commands in the
-// middle differ. copyBuffer was the only caller; there are five now.
+// The checkpoint is deliberately quiet: both objects created, nothing on
+// screen different, and the startup log otherwise identical to step 1's apart
+// from the new lines. Verifying by the ABSENCE of a diff is what caught the
+// descriptor mistake in Phase 4.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -422,6 +413,12 @@ private:
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
 
+    // Phase 5 step 2. The view is what makes the image readable at all; the
+    // sampler is independent of it and of every other image, and could be
+    // shared by all of them.
+    VkImageView textureImageView;
+    VkSampler textureSampler;
+
     // Fixed here rather than read out of a file header, which is the one real
     // consequence of generating the texture instead of loading it. 256/32 = 8
     // squares a side, every boundary on an exact texel, and squares big enough
@@ -528,6 +525,11 @@ private:
 
         // After the pool, which its transitions and copies submit through.
         createTextureImage();
+
+        // The view makes the image readable; the sampler is independent of it
+        // and of every image, and is only paired with one in step 3.
+        createTextureImageView();
+        createTextureSampler();
 
         createVertexBuffer();
         createIndexBuffer();
@@ -1066,45 +1068,66 @@ private:
                   << swapChainExtent.height << std::endl;
     }
 
+    // One view per swapchain image. Only the loop is left here: Phase 5 step 2
+    // moved the view itself into createImageView below, because the texture
+    // needs byte-for-byte the same construction and the storage image will be
+    // a third caller.
     void createImageViews() {
         swapChainImageViews.resize(swapChainImages.size());
 
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            VkImageViewCreateInfo createInfo{};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImages[i];
-
-            // How to read it: a plain 2D texture, in the format the swapchain
-            // was created with -- which is why step 2c kept that around.
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = swapChainImageFormat;
-
-            // The swizzle. IDENTITY throughout means no channel remapping;
-            // this is where you would broadcast red to every channel for a
-            // monochrome view without touching the image underneath.
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-
-            // Which part of the image the view covers: colour data rather than
-            // depth or stencil, no mipmaps, and one array layer -- which has
-            // to agree with the imageArrayLayers = 1 set in step 2c.
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-
-            if (vkCreateImageView(device, &createInfo, nullptr,
-                                  &swapChainImageViews[i]) != VK_SUCCESS) {
-                throw std::runtime_error("failed to create image views!");
-            }
+            // The format the swapchain was created with, which is why step 2c
+            // kept that around.
+            swapChainImageViews[i] =
+                createImageView(swapChainImages[i], swapChainImageFormat);
         }
 
         std::cout << "Image views created: " << swapChainImageViews.size()
                   << " for " << swapChainImages.size()
                   << " swapchain image(s)" << std::endl;
+    }
+
+    // Nothing in Vulkan binds a VkImage. A shader or a framebuffer binds a
+    // VIEW, which is an interpretation layered over the image's storage: how
+    // to read it, which part of it, and with what channel remapping. The
+    // image can outlive any particular reading of it, and can be read several
+    // ways at once.
+    VkImageView createImageView(VkImage image, VkFormat format) {
+        VkImageViewCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        createInfo.image = image;
+
+        // How to read it: a plain 2-D texture. This is the field that would
+        // say CUBE or 2D_ARRAY for the same underlying memory.
+        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        createInfo.format = format;
+
+        // The swizzle. IDENTITY throughout means no channel remapping; this is
+        // where you would broadcast red to every channel for a monochrome view
+        // without touching the image underneath.
+        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+
+        // Which part of the image the view covers: colour data rather than
+        // depth or stencil, no mipmaps, and one array layer. For a swapchain
+        // image that has to agree with the imageArrayLayers = 1 set in step
+        // 2c; for the texture, with the mipLevels = 1 and arrayLayers = 1 set
+        // in createImage.
+        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        createInfo.subresourceRange.baseMipLevel = 0;
+        createInfo.subresourceRange.levelCount = 1;
+        createInfo.subresourceRange.baseArrayLayer = 0;
+        createInfo.subresourceRange.layerCount = 1;
+
+        VkImageView imageView;
+        if (vkCreateImageView(device, &createInfo, nullptr, &imageView) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create image view!");
+        }
+
+        return imageView;
     }
 
     void createRenderPass() {
@@ -1938,6 +1961,103 @@ private:
             throw std::runtime_error(
                 "texture readback does not match the generated pixels");
         }
+    }
+
+    void createTextureImageView() {
+        // The same call the swapchain images get, with the format the image
+        // was created with in step 1. A view's format has to be compatible
+        // with its image's -- it is an interpretation, not a conversion, and
+        // naming an unrelated format here is an error rather than a cast.
+        textureImageView =
+            createImageView(textureImage, VK_FORMAT_R8G8B8A8_UNORM);
+
+        std::cout << "Texture image view created: VK_FORMAT_R8G8B8A8_UNORM, "
+                  << "1 mip level, 1 array layer" << std::endl;
+    }
+
+    void createTextureSampler() {
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+
+        // Magnification is what happens here: a 256x256 texture stretched
+        // across a quad that covers most of an 800x600 window means several
+        // screen pixels per texel. LINEAR blends the four nearest texels;
+        // NEAREST would take one and leave the square boundaries perfectly
+        // sharp. Both are defensible for a checkerboard -- LINEAR is chosen so
+        // that step 3 shows filtering happening rather than hiding it, and
+        // because the artefact it removes is the one a path tracer's output
+        // benefits from when render resolution and window size differ.
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+
+        // What happens outside [0,1]. REPEAT tiles, which is the useful
+        // default and is invisible here because step 3's coordinates stay in
+        // range. The alternatives are MIRRORED_REPEAT, CLAMP_TO_EDGE and
+        // CLAMP_TO_BORDER, and only the last needs borderColor below to mean
+        // anything. W is set for symmetry; a 2-D sampler never consults it.
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+        // Deliberate deviation -- the tutorial enables this. See the file
+        // header: anisotropy fixes blur on a surface seen at a grazing angle,
+        // this renderer ends up displaying an image face-on at 1:1, and
+        // VK_TRUE here without the samplerAnisotropy device feature (which
+        // createLogicalDevice does not enable) is a validation error rather
+        // than a quality setting. maxAnisotropy is ignored while this is
+        // FALSE; it is set to the floor rather than left zero so the struct
+        // reads as a decision instead of an oversight.
+        samplerInfo.anisotropyEnable = VK_FALSE;
+        samplerInfo.maxAnisotropy = 1.0f;
+
+        // Only consulted by CLAMP_TO_BORDER, which is not in use. Without an
+        // extension this field takes a handful of enum values -- transparent,
+        // opaque black, opaque white -- and not an arbitrary colour.
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+
+        // VK_FALSE means texture coordinates run [0,1) regardless of size,
+        // which is what lets a shader sample a texture without knowing its
+        // resolution. VK_TRUE would make them [0,width) x [0,height) and tie
+        // the shader to this image. Worth knowing because step 7 sidesteps
+        // samplers entirely and addresses the storage image by integer pixel
+        // -- that is imageLoad, not a sampler, and the distinction is easy to
+        // blur.
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+        // Percentage-closer filtering for shadow maps: compare the sampled
+        // value against a reference and return the fraction that passes,
+        // rather than the value. Nothing here wants it.
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+
+        // Inert with one mip level, which is what createImage made. Set
+        // explicitly so that adding a mip chain later is a visible change to
+        // these lines rather than a silent change in behaviour.
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 0.0f;
+
+        // Note what is NOT in this struct: any mention of an image. That is
+        // the whole point of a sampler being its own object. The two are
+        // paired later, in a descriptor, and either can be swapped without
+        // rebuilding the other.
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create texture sampler!");
+        }
+
+        // So the declined feature is visible rather than merely absent.
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+
+        std::cout << "Texture sampler created: LINEAR mag/min, REPEAT address"
+                  << "\n\tanisotropy:  disabled (hardware supports up to "
+                  << properties.limits.maxSamplerAnisotropy
+                  << "x, and samplerAnisotropy is not an enabled device "
+                     "feature)"
+                  << "\n\treferences:  no image -- a sampler is rules only"
+                  << std::endl;
     }
 
     void createVertexBuffer() {
@@ -3208,9 +3328,14 @@ private:
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
 
-        // Image before its memory, the same rule as a buffer. Nothing refers
-        // to it in this step; from step 3 a descriptor set will, and that set
-        // dies with the pool destroyed above.
+        // Sampler first, though it is the one object here that references
+        // nothing -- it could be destroyed at any point. The view genuinely
+        // must precede the image it interprets, and the image its memory.
+        vkDestroySampler(device, textureSampler, nullptr);
+        vkDestroyImageView(device, textureImageView, nullptr);
+
+        // From step 3 a descriptor set will refer to both of the above, and
+        // that set dies with the pool destroyed earlier.
         vkDestroyImage(device, textureImage, nullptr);
         vkFreeMemory(device, textureImageMemory, nullptr);
 
