@@ -1,63 +1,67 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 2 -- vulkan-tutorial.com "Image view and sampler":
-// https://vulkan-tutorial.com/Texture_mapping/Image_view_and_sampler
+// Phase 5, step 3 -- vulkan-tutorial.com "Combined image sampler":
+// https://vulkan-tutorial.com/Texture_mapping/Combined_image_sampler
 //
-// Two objects, neither of which changes a pixel. Step 1 left a filled image
-// in SHADER_READ_ONLY_OPTIMAL that nothing could read, because nothing reads
-// a VkImage: shaders and framebuffers bind a VIEW. The image is STORAGE; the
-// view is an INTERPRETATION of it -- which mip levels, which array layers,
-// colour or depth aspect, read as what type, with what channel remapping. One
-// image can carry several views at once: a cube map seen as six 2-D layers, a
-// mip chain seen as one level, an RGBA image seen with red broadcast to every
-// channel. createImageViews already did this for the swapchain in Phase 2, so
-// the code here is extracted rather than written, and createImageView now
-// serves both callers.
+// The first visible change of Phase 5, and the step that pairs the image with
+// the sampler. GLSL's sampler2D is ONE thing to the shader and TWO to Vulkan:
+// COMBINED_IMAGE_SAMPLER is a descriptor holding both an image view and a
+// sampler. Vulkan also has them apart, as SAMPLED_IMAGE and SAMPLER, which in
+// GLSL is texture2D plus sampler joined in-shader as sampler2D(tex, samp).
+// The combined form exists because much hardware -- mobile especially --
+// implements texture fetch as a fused unit, so one descriptor becomes one
+// hardware descriptor. The separate form avoids N*M descriptors for N images
+// and M samplers, and can be slower.
 //
-// The sampler is the one that catches people out. In OpenGL, filtering and
-// wrapping were state ON the texture. A VkSampler is a wholly separate object
-// that references no image at all -- just a bundle of rules: how to blend
-// texels when magnifying, when minifying, what happens outside [0,1], how to
-// choose mip levels. They are separate because the pairing is many-to-many.
-// 500 textures and 3 sampling policies is 503 objects rather than 1500, and
-// one shader can read the same image through two samplers in a single draw,
-// one clamping and one repeating.
+// THE FIELD THAT MATTERS MOST HERE is VkDescriptorImageInfo::imageLayout. It
+// is a PROMISE about the layout the image will be in when a shader reads it,
+// not a request to put it there. Nothing in vkUpdateDescriptorSets transitions
+// anything. Step 1 parked this image in SHADER_READ_ONLY_OPTIMAL precisely so
+// that the promise is already true and this step needs no barrier at all. A
+// false promise yields undefined texels, and validation catches it only when
+// it can track the layout. Step 4's storage image declares GENERAL on exactly
+// this reasoning.
 //
-// magFilter is the only choice here with a visible consequence, and it lands
-// in step 3: NEAREST takes the single closest texel and gives razor-sharp
-// square edges, LINEAR blends the four surrounding ones and softens every
-// boundary. On a 256x256 checkerboard stretched across the quad the
-// difference is unmistakable, which is what makes it a good thing to have
-// chosen deliberately before the first time anything is on screen.
+// Both bindings go in ONE set, which is the tutorial's arrangement and is
+// arguably wrong. A descriptor SET groups resources by UPDATE FREQUENCY, not
+// by shader stage, because binding a set is what costs. The UBO at binding 0
+// changes every frame; the texture at binding 1 never changes at all, so they
+// belong in different sets. Said here rather than fixed, because the path
+// tracer is where it starts to matter: set 0 for the per-frame camera, set 1
+// for scene data written once.
 //
-// Three traps:
+// Four traps:
 //
-//   1. anisotropyEnable = VK_TRUE is not free. It needs the samplerAnisotropy
-//      DEVICE FEATURE, enabled back at device creation, and maxAnisotropy
-//      clamped to maxSamplerAnisotropy, which has to be queried. See the
-//      deviation below.
-//   2. unnormalizedCoordinates switches texture coordinates between [0,1) and
-//      [0,width). VK_FALSE is nearly always right, and it is what makes a
-//      shader independent of the texture's resolution.
-//   3. CLAMP_TO_BORDER needs borderColor set, and without an extension that
-//      field accepts a handful of enum values rather than an arbitrary colour.
+//   1. A second descriptor TYPE needs its own VkDescriptorPoolSize entry. Add
+//      binding 1 to the layout and forget the pool and
+//      vkAllocateDescriptorSets returns VK_ERROR_OUT_OF_POOL_MEMORY. Loud,
+//      and exactly what Phase 4's two-independent-budgets lesson predicted.
+//   2. pImageInfo, not pBufferInfo. The three payload pointers in
+//      VkWriteDescriptorSet are mutually exclusive and the one that matters is
+//      chosen by descriptorType.
+//   3. Vulkan texture space puts (0,0) at the TOP-LEFT, matching its y-down
+//      clip space; OpenGL puts it bottom-left. Vertex 0 here is the top-left
+//      corner at y = -0.5 and maps to texCoord (0,0) with no flip -- the two
+//      conventions agree, which is why a ported texture silently renders
+//      upside down.
+//   4. stageFlags must name FRAGMENT for binding 1. A stage left out cannot
+//      see the binding at all; the vertex stage having access to binding 0
+//      does nothing for the fragment stage.
 //
-// Deliberate deviation: anisotropyEnable stays VK_FALSE, where the tutorial
-// turns it on. Anisotropic filtering corrects blur when a TEXTURED SURFACE is
-// seen at a grazing angle, so the pixel's footprint in texture space is a long
-// thin ellipse instead of a circle. That is a rasterisation concern about
-// surface textures. Step 7 displays a compute-generated image full-screen at
-// essentially 1:1, where the footprint IS a circle and there is nothing to
-// correct. Enabling it would mean reaching back into Phase 1 to turn on a
-// device feature, adding a support check to isDeviceSuitable and querying a
-// limit, for an effect this renderer never uses -- and a feature enabled but
-// unused is not always free. The limit is printed anyway, so what was declined
-// is visible rather than merely absent.
+// The checkpoint is rotation-invariant on purpose. The quad is turning, so
+// "which corner is magenta" has no stable answer, but the NUMBER OF SQUARES
+// along an edge does: UVs spanning [0,1] over a 256 px texture with 32 px
+// squares is 8 per edge. A [0,8] UV range would tile to 64 per edge under
+// REPEAT, and all-zero UVs would give one flat magenta quad. Orientation -- a
+// flipped V -- is deliberately NOT verified here; step 7's gradient is
+// asymmetric by construction and gets checked by readback instead.
 //
-// The checkpoint is deliberately quiet: both objects created, nothing on
-// screen different, and the startup log otherwise identical to step 1's apart
-// from the new lines. Verifying by the ABSENCE of a diff is what caught the
-// descriptor mistake in Phase 4.
+// The fragment shader outputs the texture ALONE, where the tutorial offers
+// multiplying by the interpolated vertex colour. One variable at a time: a
+// tinted checkerboard makes "is this the right texture" far harder to answer
+// by eye. shader.vert still writes fragColor and nothing now consumes it,
+// which is legal -- an unmatched vertex output is discarded -- and the vertex
+// colours go away for good in step 7 along with the vertex buffer itself.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -190,6 +194,14 @@ struct Vertex {
     glm::vec2 pos;
     glm::vec3 color;
 
+    // Where in the texture this corner sits. Vulkan's texture space has (0,0)
+    // at the TOP-LEFT, which agrees with its y-down clip space -- so the
+    // corner at y = -0.5 takes v = 0 and no flip is needed anywhere. OpenGL
+    // puts (0,0) at the bottom-left, and that single difference is why a
+    // texture ported between the two renders upside down with nothing
+    // reported.
+    glm::vec2 texCoord;
+
     // How far apart consecutive vertices sit, and when the read pointer
     // advances. VERTEX advances once per vertex; INSTANCE would advance once
     // per instance instead, which is how one mesh gets drawn thousands of
@@ -208,9 +220,9 @@ struct Vertex {
 
     // One per `in` variable the vertex shader declares. location is the entire
     // contract with GLSL -- field names are never matched against anything.
-    static std::array<VkVertexInputAttributeDescription, 2>
+    static std::array<VkVertexInputAttributeDescription, 3>
     getAttributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 2>
+        std::array<VkVertexInputAttributeDescription, 3>
             attributeDescriptions{};
 
         // format reuses the image format enum, which reads oddly for a
@@ -227,6 +239,16 @@ struct Vertex {
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
 
+        // Two floats again, like pos. location = 2 is the number shader.vert
+        // writes as layout(location = 2); the name texCoord is matched against
+        // nothing. Adding this grows sizeof(Vertex) from 20 to 28 bytes, so
+        // the stride above changes without a line of it being edited -- which
+        // is the entire reason it is sizeof(Vertex) and these are offsetof.
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
         return attributeDescriptions;
     }
 };
@@ -236,10 +258,11 @@ struct Vertex {
 // entries here means nothing beyond fixing what each index refers to. Y points
 // DOWN, so y = -0.5 is the TOP of the screen.
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // 0  top-left      red
-    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}}, // 1  top-right     green
-    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}}, // 2  bottom-right  blue
-    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}}  // 3  bottom-left   white
+    //  position          colour            texCoord
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 0  top-left
+    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}}, // 1  top-right
+    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}}, // 2  bottom-right
+    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}  // 3  bottom-left
 };
 
 // Which pool entry each corner of each triangle uses. THIS is now the geometry;
@@ -1330,6 +1353,22 @@ private:
 
     // Only the usage flags this backend sets. Printed because the two
     // buffers below differ chiefly in these and in their memory properties.
+    // Only the formats this file's vertex attributes actually use. Deriving
+    // the name from the enum keeps it honest; a parallel array of attribute
+    // names is what went stale when step 3 added a third attribute.
+    static std::string vertexFormatString(VkFormat format) {
+        switch (format) {
+            case VK_FORMAT_R32G32_SFLOAT:
+                return "R32G32_SFLOAT, vec2";
+            case VK_FORMAT_R32G32B32_SFLOAT:
+                return "R32G32B32_SFLOAT, vec3";
+            case VK_FORMAT_R32G32B32A32_SFLOAT:
+                return "R32G32B32A32_SFLOAT, vec4";
+            default:
+                return "unnamed format";
+        }
+    }
+
     static std::string bufferUsageString(VkBufferUsageFlags flags) {
         std::string out;
         if (flags & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) {
@@ -2177,7 +2216,10 @@ private:
                   << "\n\tgeometry:  " << vertices.size() << " vertices ("
                   << vertexBytes << " B) + " << indices.size() << " indices ("
                   << bufferSize << " B) = " << (vertexBytes + bufferSize)
-                  << " B, was 120 B as 6 vertices" << std::endl;
+                  << " B, against "
+                  << (indices.size() * sizeof(Vertex))
+                  << " B for " << indices.size()
+                  << " duplicated vertices" << std::endl;
     }
 
     // Declares the SHAPE of what a shader can reach: "there is a slot 0, it
@@ -2210,11 +2252,37 @@ private:
         // where a sampler's state can be frozen into the layout itself.
         uboLayoutBinding.pImmutableSamplers = nullptr;
 
+        // Binding 1: the texture. A second binding in the SAME set, read by a
+        // DIFFERENT stage, which is routine -- and see the file header on why
+        // grouping by update frequency would actually put these in two sets.
+        VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+        samplerLayoutBinding.binding = 1;
+        samplerLayoutBinding.descriptorType =
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        samplerLayoutBinding.descriptorCount = 1;
+
+        // FRAGMENT, because that is where texture() is called. The vertex
+        // stage's access to binding 0 grants nothing here: a stage left out
+        // cannot see the binding at all. Sampling in the vertex stage is legal
+        // and occasionally useful -- displacement mapping -- and would mean
+        // naming both stages.
+        samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        // Now the field that was inert at binding 0. A non-null value here
+        // freezes sampler state into the LAYOUT, so the descriptor carries
+        // only the image and every set made from this layout shares one
+        // sampler. Left null: the sampler travels in the descriptor instead,
+        // which is what makes it swappable per set.
+        samplerLayoutBinding.pImmutableSamplers = nullptr;
+
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {
+            uboLayoutBinding, samplerLayoutBinding};
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &uboLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
                                         &descriptorSetLayout) != VK_SUCCESS) {
@@ -2223,14 +2291,19 @@ private:
         }
 
         std::cout << "Descriptor set layout created: "
-                  << layoutInfo.bindingCount << " binding"
+                  << layoutInfo.bindingCount << " bindings"
                   << "\n\tbinding 0:  UNIFORM_BUFFER x"
                   << uboLayoutBinding.descriptorCount
                   << ", readable by VERTEX"
+                  << "\n\tbinding 1:  COMBINED_IMAGE_SAMPLER x"
+                  << samplerLayoutBinding.descriptorCount
+                  << ", readable by FRAGMENT"
                   << "\n\tdescribes:  "
                   << sizeof(UniformBufferObject)
-                  << " B of UniformBufferObject (one mat4)"
-                  << "\n\tpoints at:  nothing -- a layout names no buffer"
+                  << " B of UniformBufferObject (one mat4), plus an image+"
+                     "sampler pair"
+                  << "\n\tpoints at:  nothing -- a layout names no buffer,"
+                     " image or sampler"
                   << std::endl;
     }
 
@@ -2300,14 +2373,24 @@ private:
     // buffer each needs 10 and 10; one set holding ten would need 10 and 1.
     // Exhausting either one fails.
     void createDescriptorPool() {
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // ONE ENTRY PER DESCRIPTOR TYPE, and the counts are per type rather
+        // than per set. Adding binding 1 to the layout without adding its
+        // entry here is VK_ERROR_OUT_OF_POOL_MEMORY from
+        // vkAllocateDescriptorSets -- the pool would have had the sets to give
+        // but not the descriptors to put in them, which is Phase 4's
+        // two-independent-budgets lesson arriving as a real error.
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount =
+            static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount =
+            static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
         poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         // No flags. VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT would
@@ -2323,8 +2406,10 @@ private:
 
         std::cout << "Descriptor pool created:"
                   << "\n\tcapacity:  " << poolInfo.maxSets << " sets, "
-                  << poolSize.descriptorCount
-                  << " UNIFORM_BUFFER descriptors"
+                  << poolSizes[0].descriptorCount
+                  << " UNIFORM_BUFFER + " << poolSizes[1].descriptorCount
+                  << " COMBINED_IMAGE_SAMPLER descriptors"
+                  << "\n\tbudgets:   per type, and independent of maxSets"
                   << "\n\tgrowth:    none -- a pool is fixed at creation"
                   << "\n\tfreeing:   sets are released with the pool, not"
                      " individually"
@@ -2396,12 +2481,54 @@ private:
             // accumulation and output images will use pImageInfo here.
             descriptorWrite.pBufferInfo = &bufferInfo;
 
-            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+            // The image side. imageLayout is the field worth stopping on: it
+            // DECLARES the layout the image will be in when a shader reads it
+            // and does not put it there. Nothing below transitions anything.
+            // Step 1 left this image in SHADER_READ_ONLY_OPTIMAL exactly so
+            // the declaration is already true; a false one gives undefined
+            // texels, caught only when validation can track the layout.
+            //
+            // Both handles in one descriptor is what COMBINED means. Either
+            // could be swapped by rewriting this set, without rebuilding the
+            // other or touching the layout.
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = textureImageView;
+            imageInfo.sampler = textureSampler;
+
+            VkWriteDescriptorSet samplerWrite{};
+            samplerWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            samplerWrite.dstSet = descriptorSets[i];
+            samplerWrite.dstBinding = 1;
+            samplerWrite.dstArrayElement = 0;
+            samplerWrite.descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            samplerWrite.descriptorCount = 1;
+
+            // pImageInfo this time, not pBufferInfo. The three payload
+            // pointers are mutually exclusive and descriptorType picks which
+            // one is read; filling the wrong one is not a type error in C++.
+            samplerWrite.pImageInfo = &imageInfo;
+
+            // Both writes in one call. vkUpdateDescriptorSets takes an array
+            // precisely so a set can be populated in a single host-side
+            // operation rather than one call per binding.
+            std::array<VkWriteDescriptorSet, 2> writes = {descriptorWrite,
+                                                          samplerWrite};
+            vkUpdateDescriptorSets(device,
+                                   static_cast<uint32_t>(writes.size()),
+                                   writes.data(), 0, nullptr);
 
             std::cout << "\tset " << i << ": binding 0 -> buffer "
                       << reinterpret_cast<const void*>(uniformBuffers[i])
                       << ", offset " << bufferInfo.offset << ", range "
-                      << bufferInfo.range << " B" << std::endl;
+                      << bufferInfo.range << " B"
+                      << "\n\t       binding 1 -> view "
+                      << reinterpret_cast<const void*>(textureImageView)
+                      << " + sampler "
+                      << reinterpret_cast<const void*>(textureSampler)
+                      << ", declared layout SHADER_READ_ONLY_OPTIMAL"
+                      << std::endl;
         }
 
         std::cout << "\twritten:  on the host by vkUpdateDescriptorSets, no"
@@ -2902,16 +3029,21 @@ private:
                   << " binding at slot " << bindingDescription.binding
                   << ", stride " << bindingDescription.stride << " B, "
                   << vertexInputInfo.vertexAttributeDescriptionCount
-                  << " attributes"
-                  << "\n\t               location 0: offset "
-                  << attributeDescriptions[0].offset << " B, format "
-                  << attributeDescriptions[0].format
-                  << " (R32G32_SFLOAT, vec2 pos)"
-                  << "\n\t               location 1: offset "
-                  << attributeDescriptions[1].offset << " B, format "
-                  << attributeDescriptions[1].format
-                  << " (R32G32B32_SFLOAT, vec3 color)"
-                  << "\n\ttopology:      TRIANGLE_LIST, "
+                  << " attributes";
+
+        // A loop rather than one hardcoded line per attribute. The previous
+        // form claimed "3 attributes" and then listed two the moment step 3
+        // added texCoord, which is the failure mode of every hand-maintained
+        // parallel list. The format NAME is derived from the enum for the same
+        // reason -- a names array beside this would desynchronise next time.
+        for (const auto& attribute : attributeDescriptions) {
+            std::cout << "\n\t               location " << attribute.location
+                      << ": offset " << attribute.offset << " B, format "
+                      << attribute.format << " ("
+                      << vertexFormatString(attribute.format) << ")";
+        }
+
+        std::cout << "\n\ttopology:      TRIANGLE_LIST, "
                   << viewportState.viewportCount << " viewport"
                   << "\n\trasterizer:    FILL, cull BACK, front face CLOCKWISE"
                   << "\n\tmultisample:   "
