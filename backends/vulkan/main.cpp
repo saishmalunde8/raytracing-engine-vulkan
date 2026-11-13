@@ -1,67 +1,72 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 3 -- vulkan-tutorial.com "Combined image sampler":
-// https://vulkan-tutorial.com/Texture_mapping/Combined_image_sampler
+// Phase 5, step 4 -- no tutorial page of its own. The storage image, which
+// vulkan-tutorial.com introduces part-way into the compute chapter:
+// https://vulkan-tutorial.com/Compute_Shader
 //
-// The first visible change of Phase 5, and the step that pairs the image with
-// the sampler. GLSL's sampler2D is ONE thing to the shader and TWO to Vulkan:
-// COMBINED_IMAGE_SAMPLER is a descriptor holding both an image view and a
-// sampler. Vulkan also has them apart, as SAMPLED_IMAGE and SAMPLER, which in
-// GLSL is texture2D plus sampler joined in-shader as sampler2D(tex, samp).
-// The combined form exists because much hardware -- mobile especially --
-// implements texture fetch as a fused unit, so one descriptor becomes one
-// hardware descriptor. The separate form avoids N*M descriptors for N images
-// and M samplers, and can be slower.
+// Split out as its own step because it is a complete, independently
+// verifiable thing and that chapter is large. Nothing on screen changes here.
+// What appears is one more VkImage -- 800x600, R8G8B8A8_UNORM -- created with
+// VK_IMAGE_USAGE_STORAGE_BIT, parked in VK_IMAGE_LAYOUT_GENERAL, and cleared
+// to a sentinel colour.
 //
-// THE FIELD THAT MATTERS MOST HERE is VkDescriptorImageInfo::imageLayout. It
-// is a PROMISE about the layout the image will be in when a shader reads it,
-// not a request to put it there. Nothing in vkUpdateDescriptorSets transitions
-// anything. Step 1 parked this image in SHADER_READ_ONLY_OPTIMAL precisely so
-// that the promise is already true and this step needs no barrier at all. A
-// false promise yields undefined texels, and validation catches it only when
-// it can track the layout. Step 4's storage image declares GENERAL on exactly
-// this reasoning.
+// A STORAGE IMAGE is an image a shader can WRITE. Everything the GPU has
+// touched up to now has been read-only to it: vertex data, a uniform block, a
+// sampled texture. A path tracer's output is the other direction -- the shader
+// computes a colour for a pixel and stores it -- and a storage image is the
+// resource that permits that. In GLSL it is not sampler2D but image2D: it
+// takes INTEGER texel coordinates rather than normalised UVs, it has no
+// sampler and therefore no filtering or addressing rules at all, and it is
+// written with imageStore rather than read by texture().
 //
-// Both bindings go in ONE set, which is the tutorial's arrangement and is
-// arguably wrong. A descriptor SET groups resources by UPDATE FREQUENCY, not
-// by shader stage, because binding a set is what costs. The UBO at binding 0
-// changes every frame; the texture at binding 1 never changes at all, so they
-// belong in different sets. Said here rather than fixed, because the path
-// tracer is where it starts to matter: set 0 for the per-frame camera, set 1
-// for scene data written once.
+// VK_IMAGE_LAYOUT_GENERAL is the one layout in which a shader may both read
+// and write an image, and it is the slowest layout there is. That is not a
+// coincidence. Every other layout is a PROMISE that the image will be used one
+// particular way, and the promise is what lets the driver arrange its memory
+// for that use. GENERAL is the absence of the promise. An image that compute
+// writes and the fragment stage samples has no single access pattern to
+// promise, so it pays for the generality -- and once in GENERAL it stays
+// there, which is why this step needs exactly one transition and step 5 needs
+// none at all.
+//
+// THE SENTINEL. The image is cleared to pure opaque blue (0,0,255,255) before
+// anything else touches it. Step 5's gradient cannot produce that value, so
+// from here on a blue storage image means the dispatch did not run -- a state
+// otherwise indistinguishable from a dispatch that ran and wrote nothing,
+// because freshly allocated device memory can read back as zeroes and look
+// deliberate. The clear is also what makes THIS step checkable at all: a
+// transition out of UNDEFINED is defined to discard whatever was there, so an
+// uncleared image has no contents to be right or wrong about.
 //
 // Four traps:
 //
-//   1. A second descriptor TYPE needs its own VkDescriptorPoolSize entry. Add
-//      binding 1 to the layout and forget the pool and
-//      vkAllocateDescriptorSets returns VK_ERROR_OUT_OF_POOL_MEMORY. Loud,
-//      and exactly what Phase 4's two-independent-budgets lesson predicted.
-//   2. pImageInfo, not pBufferInfo. The three payload pointers in
-//      VkWriteDescriptorSet are mutually exclusive and the one that matters is
-//      chosen by descriptorType.
-//   3. Vulkan texture space puts (0,0) at the TOP-LEFT, matching its y-down
-//      clip space; OpenGL puts it bottom-left. Vertex 0 here is the top-left
-//      corner at y = -0.5 and maps to texCoord (0,0) with no flip -- the two
-//      conventions agree, which is why a ported texture silently renders
-//      upside down.
-//   4. stageFlags must name FRAGMENT for binding 1. A stage left out cannot
-//      see the binding at all; the vertex stage having access to binding 0
-//      does nothing for the fragment stage.
+//   1. USAGE FLAGS ARE NOT CHECKED AT CREATION. Omit TRANSFER_DST and
+//      vkCreateImage succeeds happily; vkCmdClearColorImage is what fails,
+//      in a different function and possibly a different step. A clear is a
+//      TRANSFER operation, not a free-standing "set the pixels" command.
+//   2. FORMAT FEATURES are a third kind of capability, after step 2's device
+//      limit and device feature. Storage-image support is per-format AND
+//      per-tiling. R8G8B8A8_UNORM is spec-required to have it; the
+//      R32G32B32A32_SFLOAT this project will want for HDR accumulation is
+//      not, and the query is identical, which is why it is made here.
+//   3. VkClearColorValue is a UNION whose member is chosen by the format's
+//      NUMERIC TYPE, not its bit depth. UNORM and SFLOAT both read float32;
+//      only integer formats read int32/uint32. Filling the wrong member is
+//      not a type error, and 255 written as a uint32 and reinterpreted as a
+//      float is a denormal -- which clears to black.
+//   4. RENDER RESOLUTION IS NOT THE WINDOW SIZE, deliberately. A fixed
+//      800x600 means this image survives every swapchain recreation
+//      untouched, and it is what a path tracer wants anyway: samples
+//      accumulate into a fixed grid, and a resize rescales the result rather
+//      than discarding it. Step 7 samples it with normalised coordinates, so
+//      a mismatched window stretches the image instead of cropping it.
 //
-// The checkpoint is rotation-invariant on purpose. The quad is turning, so
-// "which corner is magenta" has no stable answer, but the NUMBER OF SQUARES
-// along an edge does: UVs spanning [0,1] over a 256 px texture with 32 px
-// squares is 8 per edge. A [0,8] UV range would tile to 64 per edge under
-// REPEAT, and all-zero UVs would give one flat magenta quad. Orientation -- a
-// flipped V -- is deliberately NOT verified here; step 7's gradient is
-// asymmetric by construction and gets checked by readback instead.
-//
-// The fragment shader outputs the texture ALONE, where the tutorial offers
-// multiplying by the interpolated vertex colour. One variable at a time: a
-// tinted checkerboard makes "is this the right texture" far harder to answer
-// by eye. shader.vert still writes fragColor and nothing now consumes it,
-// which is legal -- an unmatched vertex output is discarded -- and the vertex
-// colours go away for good in step 7 along with the vertex buffer itself.
+// The checkpoint is entirely analytic -- the screen is unchanged, and saying
+// "it still looks the same" is not evidence that an invisible image exists.
+// The whole 800x600 image is copied back to the host and compared byte for
+// byte against the sentinel, which also exercises the
+// GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL round trip that step 5's
+// checkpoint depends on.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -442,6 +447,30 @@ private:
     VkImageView textureImageView;
     VkSampler textureSampler;
 
+    // Phase 5 step 4. The image a compute shader writes in step 5 and a
+    // fullscreen triangle samples in step 7. Three things make it unlike the
+    // texture above: its usage declares STORAGE, it rests in GENERAL rather
+    // than SHADER_READ_ONLY_OPTIMAL, and no host data is ever uploaded into
+    // it -- the GPU is the only thing that will ever produce its contents.
+    VkImage storageImage;
+    VkDeviceMemory storageImageMemory;
+
+    // Created in this step rather than a later one because an image is
+    // unbindable without a view, and step 5's descriptor wants one ready.
+    // Nothing about a view says "storage": the usage flag on the IMAGE
+    // decided that, and this identical view will serve step 7's sampled read.
+    VkImageView storageImageView;
+
+    // Render resolution, deliberately NOT the window size. See trap 4 at the
+    // top of the file.
+    static const uint32_t RENDER_WIDTH = 800;
+    static const uint32_t RENDER_HEIGHT = 600;
+
+    // What the image is cleared to before anything else writes it, and the
+    // reason this step has a checkpoint. See THE SENTINEL at the top.
+    static constexpr std::array<uint8_t, 4> STORAGE_SENTINEL = {0, 0, 255,
+                                                                255};
+
     // Fixed here rather than read out of a file header, which is the one real
     // consequence of generating the texture instead of loading it. 256/32 = 8
     // squares a side, every boundary on an exact texel, and squares big enough
@@ -553,6 +582,11 @@ private:
         // and of every image, and is only paired with one in step 3.
         createTextureImageView();
         createTextureSampler();
+
+        // Independent of everything above it -- it shares only createImage,
+        // transitionImageLayout, createImageView and the command pool. The
+        // compute pipeline that writes it arrives in step 5.
+        createStorageImage();
 
         createVertexBuffer();
         createIndexBuffer();
@@ -1764,6 +1798,41 @@ private:
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                   newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+            // Step 4's storage image reaching its resting layout, and the
+            // only transition it ever gets. Nothing wrote it, so the source
+            // side is empty as before; the destination side names BOTH
+            // consumers, because the next thing to touch this image is a
+            // clear (transfer) and everything after that is compute.
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL &&
+                   newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            // Verification only, as with the texture's pair -- and worth
+            // comparing against it. The DESTINATION layout is identical to
+            // the texture's readback transition and the masks share not one
+            // bit, which is as plainly as it can be shown that the masks are
+            // not derivable from the layout names. They describe what the
+            // surrounding code does, and here that is a compute write.
+            barrier.srcAccessMask =
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                          VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+                   newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         } else {
             // Throwing beats guessing. An unlisted pair is a transition
             // nobody reasoned about, and the masks are not derivable from the
@@ -2097,6 +2166,159 @@ private:
                      "feature)"
                   << "\n\treferences:  no image -- a sampler is rules only"
                   << std::endl;
+    }
+
+    void createStorageImage() {
+        // A FORMAT FEATURE: what one particular VkFormat is permitted to be
+        // used for, which varies by tiling. See trap 2 at the top of the
+        // file for why a guaranteed format is queried anyway.
+        VkFormatProperties formatProperties;
+        vkGetPhysicalDeviceFormatProperties(
+            physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, &formatProperties);
+
+        VkFormatFeatureFlags features = formatProperties.optimalTilingFeatures;
+        bool storageSupported =
+            (features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+        bool sampledSupported =
+            (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        bool atomicSupported =
+            (features & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT) != 0;
+
+        // ATOMIC is printed because it is the one of the three a path tracer
+        // may actually miss: accumulating samples from several invocations
+        // into one texel without a race wants atomics, and no float format is
+        // required to support them.
+        std::cout << "Format R8G8B8A8_UNORM at OPTIMAL tiling: STORAGE_IMAGE "
+                  << (storageSupported ? "yes" : "no") << ", SAMPLED_IMAGE "
+                  << (sampledSupported ? "yes" : "no")
+                  << ", STORAGE_IMAGE_ATOMIC "
+                  << (atomicSupported ? "yes" : "no") << std::endl;
+
+        if (!storageSupported) {
+            throw std::runtime_error(
+                "R8G8B8A8_UNORM cannot be used as a storage image");
+        }
+
+        // Four usage flags, and each one's reason is worth stating because a
+        // missing flag is not caught here -- it is caught at the command that
+        // needed it, which may be steps away:
+        //
+        //   STORAGE      compute writes it with imageStore (step 5)
+        //   SAMPLED      the fullscreen triangle reads it (step 7)
+        //   TRANSFER_SRC readbackImage copies out of it (the checkpoints)
+        //   TRANSFER_DST vkCmdClearColorImage writes the sentinel below
+        createImage(RENDER_WIDTH, RENDER_HEIGHT, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, storageImage,
+                    storageImageMemory, "Storage image");
+
+        // GENERAL, and it never leaves except to be measured.
+        transitionImageLayout(storageImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_GENERAL);
+
+        clearStorageImage();
+
+        storageImageView =
+            createImageView(storageImage, VK_FORMAT_R8G8B8A8_UNORM);
+
+        std::cout << "Storage image: " << RENDER_WIDTH << "x" << RENDER_HEIGHT
+                  << ", resting layout "
+                  << imageLayoutString(VK_IMAGE_LAYOUT_GENERAL)
+                  << ", view created" << std::endl;
+
+        verifyStorageImageClear();
+    }
+
+    // vkCmdClearColorImage is one of the few commands that writes an image
+    // outside a render pass, and it needs the image in GENERAL or
+    // TRANSFER_DST_OPTIMAL. GENERAL already being the resting layout here is
+    // the whole reason this needs no barrier wrapped around it.
+    void clearStorageImage() {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // float32 regardless of the image's bit depth -- see trap 3 at the
+        // top of the file. Dividing by 255 rather than writing 0.0f/1.0f
+        // literals keeps one definition of the sentinel: the byte values the
+        // checkpoint compares against are the source of truth, and a UNORM
+        // format converts them back exactly.
+        VkClearColorValue clearColor{};
+        clearColor.float32[0] = STORAGE_SENTINEL[0] / 255.0f;
+        clearColor.float32[1] = STORAGE_SENTINEL[1] / 255.0f;
+        clearColor.float32[2] = STORAGE_SENTINEL[2] / 255.0f;
+        clearColor.float32[3] = STORAGE_SENTINEL[3] / 255.0f;
+
+        // The same subresource range the barriers use, for the same reason:
+        // one mip level, one array layer, the colour aspect. A clear names a
+        // range rather than an image because a mip chain or an array would
+        // otherwise need one call per level.
+        VkImageSubresourceRange range{};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount = 1;
+
+        vkCmdClearColorImage(commandBuffer, storageImage,
+                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // The checkpoint, and it has to be analytic: nothing on screen changes in
+    // this step at all. An image that was allocated but never cleared, a
+    // clear that went to the wrong layout, and an 800x600 extent that came
+    // out transposed are all silent -- and all three would let step 5 appear
+    // to "work" on a 480,000-texel surface of garbage.
+    void verifyStorageImageClear() {
+        std::vector<uint8_t> actual = readbackImage(
+            storageImage, RENDER_WIDTH, RENDER_HEIGHT,
+            VK_IMAGE_LAYOUT_GENERAL);
+
+        size_t mismatches = 0;
+        size_t firstMismatch = 0;
+        for (size_t i = 0; i < actual.size(); i++) {
+            if (actual[i] != STORAGE_SENTINEL[i % 4]) {
+                if (mismatches == 0) {
+                    firstMismatch = i;
+                }
+                mismatches++;
+            }
+        }
+
+        std::cout << "Storage image clear verified: " << actual.size()
+                  << " B read back against sentinel "
+                  << static_cast<int>(STORAGE_SENTINEL[0]) << ","
+                  << static_cast<int>(STORAGE_SENTINEL[1]) << ","
+                  << static_cast<int>(STORAGE_SENTINEL[2]) << ","
+                  << static_cast<int>(STORAGE_SENTINEL[3]) << ", "
+                  << mismatches << " mismatched byte(s)" << std::endl;
+
+        // Corner probes. The round trip through
+        // GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL is itself under test
+        // here: it is the first time this image has been through a transition
+        // pair, and it is the exact one step 5's checkpoint depends on.
+        const uint32_t probes[4][2] = {{0, 0},
+                                       {RENDER_WIDTH - 1, 0},
+                                       {0, RENDER_HEIGHT - 1},
+                                       {RENDER_WIDTH - 1, RENDER_HEIGHT - 1}};
+        for (const auto& p : probes) {
+            size_t i = (static_cast<size_t>(p[1]) * RENDER_WIDTH + p[0]) * 4;
+            std::cout << "\ttexel (" << p[0] << "," << p[1] << "): "
+                      << static_cast<int>(actual[i + 0]) << ","
+                      << static_cast<int>(actual[i + 1]) << ","
+                      << static_cast<int>(actual[i + 2]) << ","
+                      << static_cast<int>(actual[i + 3]) << std::endl;
+        }
+
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "storage image does not hold the sentinel clear colour "
+                "(first mismatch at byte " +
+                std::to_string(firstMismatch) + ")");
+        }
     }
 
     void createVertexBuffer() {
@@ -3470,6 +3692,14 @@ private:
         // that set dies with the pool destroyed earlier.
         vkDestroyImage(device, textureImage, nullptr);
         vkFreeMemory(device, textureImageMemory, nullptr);
+
+        // Step 4's storage image, by the same rule: view before image before
+        // memory. It has no sampler of its own -- nothing in step 5 samples
+        // it, and step 7 will reuse textureSampler rather than make a second
+        // one, which is the many-to-many point from step 2 cashed in.
+        vkDestroyImageView(device, storageImageView, nullptr);
+        vkDestroyImage(device, storageImage, nullptr);
+        vkFreeMemory(device, storageImageMemory, nullptr);
 
         // The same pair once per frame in flight. No vkUnmapMemory call:
         // vkFreeMemory unmaps implicitly, and uniformBuffersMapped holds
