@@ -1,72 +1,95 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 4 -- no tutorial page of its own. The storage image, which
-// vulkan-tutorial.com introduces part-way into the compute chapter:
+// Phase 5, step 5 -- vulkan-tutorial.com "Compute Shader":
 // https://vulkan-tutorial.com/Compute_Shader
 //
-// Split out as its own step because it is a complete, independently
-// verifiable thing and that chapter is large. Nothing on screen changes here.
-// What appears is one more VkImage -- 800x600, R8G8B8A8_UNORM -- created with
-// VK_IMAGE_USAGE_STORAGE_BIT, parked in VK_IMAGE_LAYOUT_GENERAL, and cleared
-// to a sentinel colour.
+// The step the whole phase exists for. A compute shader runs and writes the
+// storage image step 4 created, and for the first time this program computes
+// a picture instead of drawing one. Still nothing new on screen -- the quad
+// is still showing the checkerboard, and the gradient is verified by reading
+// all 480,000 texels back to the host and comparing them against the same
+// formula evaluated in C++.
 //
-// A STORAGE IMAGE is an image a shader can WRITE. Everything the GPU has
-// touched up to now has been read-only to it: vertex data, a uniform block, a
-// sampled texture. A path tracer's output is the other direction -- the shader
-// computes a colour for a pixel and stores it -- and a storage image is the
-// resource that permits that. In GLSL it is not sampler2D but image2D: it
-// takes INTEGER texel coordinates rather than normalised UVs, it has no
-// sampler and therefore no filtering or addressing rules at all, and it is
-// written with imageStore rather than read by texture().
+// WHAT A COMPUTE SHADER IS. Not a stage in a pipeline that ends at a
+// framebuffer. There is no vertex, no triangle, no fragment, no render pass,
+// no attachment. There is a GRID OF INVOCATIONS and whatever memory they were
+// given. An invocation's entire input is its own index, gl_GlobalInvocationID,
+// and everything else it needs it derives from that. For a path tracer that
+// index IS the pixel: the ray is computed from it, traced, and the result
+// stored.
 //
-// VK_IMAGE_LAYOUT_GENERAL is the one layout in which a shader may both read
-// and write an image, and it is the slowest layout there is. That is not a
-// coincidence. Every other layout is a PROMISE that the image will be used one
-// particular way, and the promise is what lets the driver arrange its memory
-// for that use. GENERAL is the absence of the promise. An image that compute
-// writes and the fragment stage samples has no single access pattern to
-// promise, so it pays for the generality -- and once in GENERAL it stays
-// there, which is why this step needs exactly one transition and step 5 needs
-// none at all.
+// TWO LEVELS OF GRID, and this is the one genuinely new mental model here.
+// vkCmdDispatch asks for a number of WORKGROUPS; the shader's own
+// `layout(local_size_x = 8, local_size_y = 8)` says how many INVOCATIONS are
+// in each. The total is the product: 100x75 groups of 8x8 is 480,000
+// invocations for an 800x600 image.
 //
-// THE SENTINEL. The image is cleared to pure opaque blue (0,0,255,255) before
-// anything else touches it. Step 5's gradient cannot produce that value, so
-// from here on a blue storage image means the dispatch did not run -- a state
-// otherwise indistinguishable from a dispatch that ran and wrote nothing,
-// because freshly allocated device memory can read back as zeroes and look
-// deliberate. The clear is also what makes THIS step checkable at all: a
-// transition out of UNDEFINED is defined to discard whatever was there, so an
-// uncleared image has no contents to be right or wrong about.
+// The split is not bookkeeping. Invocations within one workgroup run together
+// on one compute unit, can share fast on-chip memory, and can synchronise
+// with barrier(). Across workgroups none of that holds -- they may run in any
+// order, on any unit, or not at the same time at all. 8x8 is conventional for
+// image work because 64 is a multiple of both common hardware scheduling
+// widths (32 on NVIDIA, 64 on AMD) and because a square tile keeps each
+// group's texels near each other in memory, which matters once the image is
+// tiled rather than linear.
+//
+// HOW SMALL A COMPUTE PIPELINE IS. VkGraphicsPipelineCreateInfo carries ten
+// sub-structures: vertex input, input assembly, viewport, rasterizer,
+// multisample, depth/stencil, blend, dynamic state, layout, render pass.
+// VkComputePipelineCreateInfo carries a stage and a layout. That is the whole
+// difference, and the sizes are printed at startup rather than asserted here.
+// Everything the graphics pipeline configures is machinery for turning
+// triangles into pixels, and none of it exists on this path.
 //
 // Four traps:
 //
-//   1. USAGE FLAGS ARE NOT CHECKED AT CREATION. Omit TRANSFER_DST and
-//      vkCreateImage succeeds happily; vkCmdClearColorImage is what fails,
-//      in a different function and possibly a different step. A clear is a
-//      TRANSFER operation, not a free-standing "set the pixels" command.
-//   2. FORMAT FEATURES are a third kind of capability, after step 2's device
-//      limit and device feature. Storage-image support is per-format AND
-//      per-tiling. R8G8B8A8_UNORM is spec-required to have it; the
-//      R32G32B32A32_SFLOAT this project will want for HDR accumulation is
-//      not, and the query is identical, which is why it is made here.
-//   3. VkClearColorValue is a UNION whose member is chosen by the format's
-//      NUMERIC TYPE, not its bit depth. UNORM and SFLOAT both read float32;
-//      only integer formats read int32/uint32. Filling the wrong member is
-//      not a type error, and 255 written as a uint32 and reinterpreted as a
-//      float is a denormal -- which clears to black.
-//   4. RENDER RESOLUTION IS NOT THE WINDOW SIZE, deliberately. A fixed
-//      800x600 means this image survives every swapchain recreation
-//      untouched, and it is what a path tracer wants anyway: samples
-//      accumulate into a fixed grid, and a resize rescales the result rather
-//      than discarding it. Step 7 samples it with normalised coordinates, so
-//      a mismatched window stretches the image instead of cropping it.
+//   1. THE WORKGROUP SIZE IS DUPLICATED ACROSS TWO LANGUAGES. It is baked
+//      into the SPIR-V by the shader's local_size declaration, and the C++
+//      side needs the same number to compute how many groups to dispatch.
+//      Nothing checks that they agree. Get it wrong and the dispatch covers
+//      the wrong area: too few groups leaves part of the image untouched,
+//      too many is wasted work that writes out of bounds -- and an
+//      out-of-bounds imageStore is SILENTLY DISCARDED, not diagnosed.
+//   2. THE BOUNDS GUARD IS DEAD AT THIS RESOLUTION and stays anyway. A
+//      dispatch can only ask for whole workgroups, so an 801-wide image gets
+//      808 invocations across and seven of them have no texel. 800 and 600
+//      are multiples of 8, so the branch never fires today; the first thing
+//      that will change here is the resolution.
+//   3. THE FORMAT QUALIFIER, `layout(binding = 0, rgba8)`, is mandatory for a
+//      writeonly storage image and must match the VkImage's format. There is
+//      no sampler in the path to convert anything, so the shader itself has
+//      to know how to pack a vec4 into bytes. A mismatch is undefined
+//      behaviour, not an error.
+//   4. BIND POINTS ARE INDEPENDENT. vkCmdBindPipeline with
+//      VK_PIPELINE_BIND_POINT_COMPUTE does not disturb the graphics pipeline
+//      bound at VK_PIPELINE_BIND_POINT_GRAPHICS, and the same is true of
+//      descriptor sets. A command buffer holds both sets of state at once --
+//      which is exactly what step 7 relies on.
 //
-// The checkpoint is entirely analytic -- the screen is unchanged, and saying
-// "it still looks the same" is not evidence that an invisible image exists.
-// The whole 800x600 image is copied back to the host and compared byte for
-// byte against the sentinel, which also exercises the
-// GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL round trip that step 5's
-// checkpoint depends on.
+// THE GRADIENT IS COMPUTED IN INTEGERS, deliberately. The natural form is
+// float(coord.x) / float(size.x - 1), and it would look identical on screen.
+// But the checkpoint is a byte comparison against the CPU, a GLSL float
+// divide is specified only to within 2.5 ULP, and the UNORM conversion rounds
+// with an implementation-chosen tie rule. The margin works out roughly eight
+// times the error at this size, so it would almost certainly pass -- and
+// "almost certainly" is not what a checkpoint is for. Integer division
+// removes the question entirely and both sides run the identical expression.
+// A real path tracer's output is float and wants an HDR format; this is a
+// verification choice for one step, not a pattern.
+//
+// Blue is held at a constant 64 so that no texel can come out as step 4's
+// sentinel (0,0,255,255). Red and green both reach zero at the top-left
+// corner, so without it that one texel would be the sentinel exactly, and
+// "the dispatch never ran" would be indistinguishable from "the dispatch
+// ran" at the first place anyone would look.
+//
+// No barrier anywhere in this step. The dispatch goes through the same
+// single-time command envelope as every transition and copy so far, and
+// endSingleTimeCommands ends in vkQueueWaitIdle -- the CPU blocks until the
+// GPU is completely idle, which orders the compute write before the readback
+// by brute force. That is why the compute-to-graphics barrier is its own
+// step: it is what replaces this sledgehammer once the dispatch moves into
+// the per-frame command buffer.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -471,6 +494,28 @@ private:
     static constexpr std::array<uint8_t, 4> STORAGE_SENTINEL = {0, 0, 255,
                                                                 255};
 
+    // Phase 5 step 5. The compute path, and every object on it is separate
+    // from the graphics one. A pipeline layout names its set layouts, so
+    // binding 0 in the compute layout below has nothing whatever to do with
+    // binding 0 in descriptorSetLayout above -- they are different
+    // namespaces, reached through different pipeline layouts.
+    VkDescriptorSetLayout computeDescriptorSetLayout;
+    VkPipelineLayout computePipelineLayout;
+    VkPipeline computePipeline;
+
+    // One set, not one per frame in flight. The storage image is written once
+    // at startup in this step and the set only ever points at the same image,
+    // so there is nothing per-frame about it -- which is the "group by update
+    // frequency" rule from step 3 landing on the opposite answer.
+    VkDescriptorSet computeDescriptorSet;
+
+    // MUST MATCH local_size_x/y in shader.comp, and nothing checks that it
+    // does. The shader bakes its workgroup size into the SPIR-V; this is what
+    // the host uses to work out how many groups to ask for. The two numbers
+    // live in different languages, in different files, compiled by different
+    // compilers, and a disagreement is silent -- see trap 1 at the top.
+    static const uint32_t WORKGROUP_SIZE = 8;
+
     // Fixed here rather than read out of a file header, which is the one real
     // consequence of generating the texture instead of loading it. 256/32 = 8
     // squares a side, every boundary on an exact texel, and squares big enough
@@ -572,6 +617,14 @@ private:
         // pipeline from that.
         createDescriptorSetLayout();
         createGraphicsPipeline();
+
+        // The compute path's own set layout and pipeline, independent of
+        // everything above. Neither touches the render pass, the framebuffers
+        // or the swapchain, which is why a compute pipeline needs nothing
+        // recreated when the window resizes.
+        createComputeDescriptorSetLayout();
+        createComputePipeline();
+
         createFramebuffers();
         createCommandPool();
 
@@ -593,6 +646,14 @@ private:
         createUniformBuffers();
         createDescriptorPool();
         createDescriptorSets();
+
+        // From the same pool as the graphics sets. Then the dispatch, which
+        // runs ONCE here: the image it writes does not change, so there is
+        // nothing to redo per frame. Step 7 moves it into the frame, which is
+        // when it stops being free.
+        createComputeDescriptorSet();
+        dispatchCompute();
+
         createCommandBuffers();
         createSyncObjects();
 
@@ -2321,6 +2382,312 @@ private:
         }
     }
 
+    void createComputeDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding storageImageBinding{};
+        storageImageBinding.binding = 0;
+
+        // STORAGE_IMAGE, not COMBINED_IMAGE_SAMPLER and not SAMPLED_IMAGE.
+        // The difference is write access: a sampled image can only be read,
+        // whatever its layout, because the descriptor type is part of what
+        // the driver checks. Declaring the wrong type here and calling
+        // imageStore in the shader is a validation error, not a silent one --
+        // this is the rare case where the type system reaches across.
+        storageImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        storageImageBinding.descriptorCount = 1;
+        storageImageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        storageImageBinding.pImmutableSamplers = nullptr;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &storageImageBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
+                                        &computeDescriptorSetLayout) !=
+            VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to create compute descriptor set layout!");
+        }
+
+        std::cout << "Compute descriptor set layout: 1 binding"
+                  << "\n\tbinding 0: STORAGE_IMAGE x1, COMPUTE stage"
+                  << "\n\tnamespace: separate from the graphics layout's"
+                     " binding 0"
+                  << std::endl;
+    }
+
+    void createComputePipeline() {
+        auto computeShaderCode =
+            readFile(std::string(SHADER_BINARY_DIR) + "/shader.comp.spv");
+        VkShaderModule computeShaderModule =
+            createShaderModule(computeShaderCode);
+
+        // The same struct the vertex and fragment stages use, with a
+        // different stage bit. A shader stage is a shader stage; what makes
+        // this one compute is where it gets plugged in.
+        VkPipelineShaderStageCreateInfo computeShaderStageInfo{};
+        computeShaderStageInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        computeShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        computeShaderStageInfo.module = computeShaderModule;
+        computeShaderStageInfo.pName = "main";
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &computeDescriptorSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 0;
+
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
+                                   &computePipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to create compute pipeline layout!");
+        }
+
+        // THE WHOLE PIPELINE. A stage and a layout. Compare the graphics
+        // equivalent, which also carries vertex input, input assembly,
+        // viewport, rasterizer, multisample, depth/stencil, blend, dynamic
+        // state and a render pass with a subpass index -- every one of them
+        // machinery for turning triangles into pixels, and none of it on this
+        // path. basePipelineHandle and basePipelineIndex exist here too, for
+        // deriving one pipeline from another, and are left at their defaults.
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.layout = computePipelineLayout;
+        pipelineInfo.stage = computeShaderStageInfo;
+
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                     nullptr, &computePipeline) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to create compute pipeline!");
+        }
+
+        // The create-info sizes alone UNDERSTATE the asymmetry, and the
+        // first run of this step is what showed it: 96 B against 144 B, a
+        // ratio of 1.5 rather than the order of magnitude the comment above
+        // implies. The reason is that VkGraphicsPipelineCreateInfo holds
+        // POINTERS to its ten state structures, so its own size counts ten
+        // pointers and not the state. The sum of the seven state structs
+        // this pipeline actually fills is printed beside it, derived with
+        // sizeof rather than counted, because a hand-totalled number here
+        // would desynchronise the same way step 3's attribute list did.
+        size_t graphicsStateBytes =
+            sizeof(VkPipelineVertexInputStateCreateInfo) +
+            sizeof(VkPipelineInputAssemblyStateCreateInfo) +
+            sizeof(VkPipelineViewportStateCreateInfo) +
+            sizeof(VkPipelineRasterizationStateCreateInfo) +
+            sizeof(VkPipelineMultisampleStateCreateInfo) +
+            sizeof(VkPipelineColorBlendStateCreateInfo) +
+            sizeof(VkPipelineDynamicStateCreateInfo);
+        std::cout << "Compute pipeline created:"
+                  << "\n\tSPIR-V:      " << computeShaderCode.size()
+                  << " B from shader.comp.spv"
+                  << "\n\tstages:      1 (COMPUTE)"
+                  << "\n\tcreate info: "
+                  << sizeof(VkComputePipelineCreateInfo) << " B, against "
+                  << sizeof(VkGraphicsPipelineCreateInfo)
+                  << " B for the graphics form -- which is a struct of"
+                     " POINTERS, and the 7 state structs it points at are a"
+                     " further "
+                  << graphicsStateBytes << " B"
+                  << "\n\tfixed state: none -- there is no rasterizer to"
+                     " configure"
+                  << "\n\trender pass: none, and no subpass index either"
+                  << std::endl;
+
+        vkDestroyShaderModule(device, computeShaderModule, nullptr);
+    }
+
+    void createComputeDescriptorSet() {
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &computeDescriptorSetLayout;
+
+        if (vkAllocateDescriptorSets(device, &allocInfo,
+                                     &computeDescriptorSet) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to allocate compute descriptor set!");
+        }
+
+        VkDescriptorImageInfo imageInfo{};
+
+        // The promise again, and this time it is unconditionally true: the
+        // storage image reached GENERAL in step 4 and never leaves it except
+        // inside readbackImage, which puts it back. Nothing here transitions
+        // anything -- see step 3's note, which is the same note.
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imageInfo.imageView = storageImageView;
+
+        // IGNORED for STORAGE_IMAGE, and left explicit rather than omitted.
+        // The same struct served the combined image sampler in step 3 with
+        // all three fields live; which fields matter is decided by the
+        // descriptorType below, exactly as pBufferInfo/pImageInfo are.
+        imageInfo.sampler = VK_NULL_HANDLE;
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = computeDescriptorSet;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        write.descriptorCount = 1;
+        write.pImageInfo = &imageInfo;
+
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+        std::cout << "Compute descriptor set written:"
+                  << "\n\tbinding 0 -> view " << storageImageView
+                  << ", sampler none, layout "
+                  << imageLayoutString(VK_IMAGE_LAYOUT_GENERAL)
+                  << "\n\tsets:       1, not one per frame -- the image it"
+                     " points at never changes"
+                  << std::endl;
+    }
+
+    void dispatchCompute() {
+        // CEILING DIVISION, not RENDER_WIDTH / WORKGROUP_SIZE. A dispatch can
+        // only ask for whole workgroups, so any dimension that is not a
+        // multiple of the group size needs one more group and a guard in the
+        // shader for the invocations that fall outside. Both are in place even
+        // though 800 and 600 are both multiples of 8 and neither does
+        // anything today.
+        uint32_t groupsX =
+            (RENDER_WIDTH + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        uint32_t groupsY =
+            (RENDER_HEIGHT + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // VK_PIPELINE_BIND_POINT_COMPUTE. A command buffer holds graphics and
+        // compute bind points INDEPENDENTLY: binding here disturbs nothing
+        // bound at the graphics point, and the same is true of the descriptor
+        // sets below. Step 7 depends on that -- it records a dispatch and a
+        // draw into the same buffer.
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          computePipeline);
+
+        // The bind point is given again, because the sets bound for compute
+        // and the sets bound for graphics are separate state.
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                computePipelineLayout, 0, 1,
+                                &computeDescriptorSet, 0, nullptr);
+
+        // Three numbers, and they are WORKGROUPS rather than invocations --
+        // the single most common thing to get wrong about this call. Asking
+        // for 800x600 here would launch 800*600*64 invocations, 64 times the
+        // intended work, with 98% of them writing out of bounds and silently
+        // discarded. It would still produce a correct-looking image.
+        vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+
+        // Ends in vkQueueWaitIdle, which is why nothing in this step needs a
+        // barrier: the CPU does not return until the GPU is entirely idle, so
+        // the compute write is complete before anything reads the image.
+        endSingleTimeCommands(commandBuffer);
+
+        std::cout << "Compute dispatched: " << groupsX << "x" << groupsY
+                  << " workgroups of " << WORKGROUP_SIZE << "x"
+                  << WORKGROUP_SIZE << " = "
+                  << (groupsX * groupsY * WORKGROUP_SIZE * WORKGROUP_SIZE)
+                  << " invocations for "
+                  << (RENDER_WIDTH * RENDER_HEIGHT) << " texels" << std::endl;
+
+        verifyComputeGradient();
+    }
+
+    // The checkpoint this whole phase was shaped around, and the reason
+    // readbackImage was written as a helper on its first use in step 1.
+    // Nothing on screen changes in this step, so the only way to know the
+    // dispatch did what it was asked is to compare all 480,000 texels against
+    // the same formula in C++.
+    //
+    // What this catches that a picture could not: a transposed coordinate
+    // mapping (gl_GlobalInvocationID.yx instead of .xy), an off-by-one in the
+    // gradient denominator, a workgroup count that leaves part of the image
+    // untouched, and a dispatch that never ran at all.
+    void verifyComputeGradient() {
+        std::vector<uint8_t> actual =
+            readbackImage(storageImage, RENDER_WIDTH, RENDER_HEIGHT,
+                          VK_IMAGE_LAYOUT_GENERAL);
+
+        size_t mismatches = 0;
+        size_t firstMismatch = 0;
+        size_t sentinelTexels = 0;
+
+        for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
+            for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
+                size_t i =
+                    (static_cast<size_t>(y) * RENDER_WIDTH + x) * 4;
+
+                // The identical integer expression shader.comp runs. Written
+                // out rather than shared, because there is no way to share it
+                // -- one copy is GLSL and the other is C++. That duplication
+                // is the real cost of this checkpoint and it is worth naming.
+                uint8_t expected[4] = {
+                    static_cast<uint8_t>((x * 255) / (RENDER_WIDTH - 1)),
+                    static_cast<uint8_t>((y * 255) / (RENDER_HEIGHT - 1)), 64,
+                    255};
+
+                for (int c = 0; c < 4; c++) {
+                    if (actual[i + c] != expected[c]) {
+                        if (mismatches == 0) {
+                            firstMismatch = i + c;
+                        }
+                        mismatches++;
+                    }
+                }
+
+                // Counted separately from the mismatches, because "still the
+                // sentinel" and "wrong value" are different diagnoses: the
+                // first means the dispatch did not reach this texel, the
+                // second that it reached it and computed the wrong thing.
+                if (actual[i + 0] == STORAGE_SENTINEL[0] &&
+                    actual[i + 1] == STORAGE_SENTINEL[1] &&
+                    actual[i + 2] == STORAGE_SENTINEL[2] &&
+                    actual[i + 3] == STORAGE_SENTINEL[3]) {
+                    sentinelTexels++;
+                }
+            }
+        }
+
+        std::cout << "Compute gradient verified: " << actual.size()
+                  << " B read back, " << mismatches << " mismatched byte(s), "
+                  << sentinelTexels << " of "
+                  << (RENDER_WIDTH * RENDER_HEIGHT)
+                  << " texels still hold the sentinel" << std::endl;
+
+        // Five probes, chosen so that a transposed mapping cannot pass. The
+        // two off-diagonal corners differ from each other, and 800 != 600, so
+        // swapping x and y changes both the values and which texels are in
+        // range.
+        const uint32_t probes[5][2] = {{0, 0},
+                                       {RENDER_WIDTH - 1, 0},
+                                       {0, RENDER_HEIGHT - 1},
+                                       {RENDER_WIDTH - 1, RENDER_HEIGHT - 1},
+                                       {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
+        for (const auto& p : probes) {
+            size_t i = (static_cast<size_t>(p[1]) * RENDER_WIDTH + p[0]) * 4;
+            std::cout << "\ttexel (" << p[0] << "," << p[1] << "): "
+                      << static_cast<int>(actual[i + 0]) << ","
+                      << static_cast<int>(actual[i + 1]) << ","
+                      << static_cast<int>(actual[i + 2]) << ","
+                      << static_cast<int>(actual[i + 3]) << "  expected "
+                      << ((p[0] * 255) / (RENDER_WIDTH - 1)) << ","
+                      << ((p[1] * 255) / (RENDER_HEIGHT - 1)) << ",64,255"
+                      << std::endl;
+        }
+
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "compute gradient does not match the host formula (first "
+                "mismatch at byte " +
+                std::to_string(firstMismatch) + ")");
+        }
+    }
+
     void createVertexBuffer() {
         VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
 
@@ -2601,7 +2968,7 @@ private:
         // vkAllocateDescriptorSets -- the pool would have had the sets to give
         // but not the descriptors to put in them, which is Phase 4's
         // two-independent-budgets lesson arriving as a real error.
-        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        std::array<VkDescriptorPoolSize, 3> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount =
             static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
@@ -2609,11 +2976,23 @@ private:
         poolSizes[1].descriptorCount =
             static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
+        // Step 5's compute set. ONE descriptor, and BOTH budgets had to grow
+        // for it: this entry for the type, and maxSets below for the set
+        // itself. A pool serving two unrelated pipelines is perfectly normal
+        // -- a pool is an allocator, and nothing about it is tied to a
+        // pipeline, a layout or a bind point.
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSizes[2].descriptorCount = 1;
+
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
         poolInfo.pPoolSizes = poolSizes.data();
-        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // One per frame in flight for the graphics sets, plus one for
+        // compute. Leave this at MAX_FRAMES_IN_FLIGHT and the per-type
+        // budget above is sufficient while the SET budget is not, which is
+        // the same VK_ERROR_OUT_OF_POOL_MEMORY from the other direction.
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) + 1;
 
         // No flags. VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT would
         // permit vkFreeDescriptorSets on individual sets; without it the only
@@ -2630,7 +3009,9 @@ private:
                   << "\n\tcapacity:  " << poolInfo.maxSets << " sets, "
                   << poolSizes[0].descriptorCount
                   << " UNIFORM_BUFFER + " << poolSizes[1].descriptorCount
-                  << " COMBINED_IMAGE_SAMPLER descriptors"
+                  << " COMBINED_IMAGE_SAMPLER + "
+                  << poolSizes[2].descriptorCount
+                  << " STORAGE_IMAGE descriptors"
                   << "\n\tbudgets:   per type, and independent of maxSets"
                   << "\n\tgrowth:    none -- a pool is fixed at creation"
                   << "\n\tfreeing:   sets are released with the pool, not"
@@ -3718,6 +4099,15 @@ private:
         // before both.
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+
+        // The compute path, by the same rule: pipeline, then the layout it
+        // was built from, then the set layout that layout names. Its
+        // descriptor set died with the pool destroyed earlier, along with the
+        // graphics ones.
+        vkDestroyPipeline(device, computePipeline, nullptr);
+        vkDestroyPipelineLayout(device, computePipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, computeDescriptorSetLayout,
+                                     nullptr);
 
         // After the pipeline layout built from it, by the same rule as
         // everything else here. A layout is only a schema, so once that

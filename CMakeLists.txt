@@ -82,3 +82,28 @@ add_dependencies(vulkan_backend shaders)
 target_compile_definitions(vulkan_backend PRIVATE
     SHADER_BINARY_DIR="${SHADER_BINARY_DIR}"
 )
+
+# ---- Phase 5, step 5: the compute shader ------------------------------------
+#
+# Appended as its own block rather than added to SHADER_SOURCES above, because
+# this file's rule is that existing lines are never edited. The cost is one
+# duplicated add_custom_command; the benefit is that everything the compute
+# step needed is visible in one place.
+#
+# Same glslc invocation as the graphics shaders -- the stage is inferred from
+# the .comp extension, so nothing here says "compute" either.
+
+set(COMPUTE_SHADER_SPIRV ${SHADER_BINARY_DIR}/shader.comp.spv)
+
+add_custom_command(
+    OUTPUT ${COMPUTE_SHADER_SPIRV}
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp
+            -o ${COMPUTE_SHADER_SPIRV}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp
+    COMMENT "Compiling shader.comp to SPIR-V"
+    VERBATIM
+)
+
+add_custom_target(compute_shader DEPENDS ${COMPUTE_SHADER_SPIRV})
+add_dependencies(vulkan_backend compute_shader)

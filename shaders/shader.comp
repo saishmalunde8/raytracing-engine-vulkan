@@ -1,0 +1,108 @@
+#version 450
+
+// Phase 5, step 5 -- vulkan-tutorial.com "Compute Shader":
+// https://vulkan-tutorial.com/Compute_Shader
+//
+// The first shader in this project that is not part of a drawing pipeline.
+// There is no vertex to transform, no triangle, no fragment, no framebuffer.
+// There is a grid of invocations and an image they write.
+
+// THE WORKGROUP SIZE, and it is baked into the SPIR-V rather than passed in.
+// A compute dispatch has two levels: vkCmdDispatch asks for a number of
+// WORKGROUPS, and this line says how many INVOCATIONS are in each one. The
+// total is the product, so 8*8 here and 100*75 groups there is 480,000
+// invocations -- one per texel of an 800x600 image.
+//
+// Why the split exists: invocations within one workgroup run together on one
+// compute unit, can share fast on-chip memory, and can synchronise with
+// barrier(). Across workgroups none of that is true -- they may run in any
+// order, on any unit, or not concurrently at all. 8x8 is the conventional
+// choice for image work: 64 invocations is a multiple of both common hardware
+// scheduling widths (32 on NVIDIA, 64 on AMD), and a square tile keeps the
+// texels each group touches close together in memory, which matters a great
+// deal once the image is tiled rather than linear.
+//
+// Nothing here is shared or synchronised yet. The path tracer is where it
+// starts to matter: rays from neighbouring pixels hit the same BVH nodes, and
+// a workgroup is the unit that could cache them.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// NOT sampler2D. A storage image is bound as image2D, and the differences are
+// not cosmetic:
+//
+//   sampler2D                    image2D
+//   normalised UV coordinates    INTEGER texel coordinates
+//   has a sampler                no sampler exists
+//   filtering, address modes     neither -- no sampler to hold a policy
+//   read with texture()          read/written with imageLoad/imageStore
+//
+// The `rgba8` is a FORMAT QUALIFIER and it is mandatory for a writeonly
+// storage image: the shader has to be told how to pack the vec4 it stores
+// into the image's actual bytes, because unlike a sampled read there is no
+// sampler in the path to do the conversion. It must match the VkImage's
+// format -- R8G8B8A8_UNORM here -- and a mismatch is undefined, not an error.
+//
+// `writeonly` is a promise that lets the compiler skip read paths. Drop it and
+// this still works; claim it and then call imageLoad and the compile fails.
+layout(binding = 0, rgba8) uniform writeonly image2D outImage;
+
+void main() {
+    // WHERE AM I. gl_GlobalInvocationID is this invocation's position in the
+    // whole dispatch grid: gl_WorkGroupID * gl_WorkGroupSize +
+    // gl_LocalInvocationID, precomputed. It is a uvec3 because a dispatch is
+    // always three-dimensional; z is 1 here and ignored.
+    //
+    // This is the entire input to a compute shader. There is no equivalent of
+    // a vertex's attributes being fed in -- the invocation is handed its own
+    // index and has to derive everything else from it. For a path tracer that
+    // index IS the pixel, and the ray is computed from it.
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+
+    // The shader can ask the image how big it is, so the dimensions need no
+    // uniform and cannot drift out of sync with the C++ side.
+    ivec2 size = imageSize(outImage);
+
+    // THE BOUNDS GUARD. Dead at this resolution and deliberately kept.
+    //
+    // A dispatch can only ask for whole workgroups, so a 801-wide image needs
+    // 101 groups of 8 and gets 808 invocations across -- seven of which have
+    // no texel. 800 and 600 are both multiples of 8, so right now this branch
+    // never fires. It stays because the first thing that will change here is
+    // the resolution, and a missing guard is the classic compute bug: the
+    // stray invocations write outside the image, which for imageStore is
+    // silently discarded rather than diagnosed, so the only symptom is
+    // whatever the extra work cost.
+    if (coord.x >= size.x || coord.y >= size.y) {
+        return;
+    }
+
+    // INTEGER MATH DECIDES THE BYTES, on purpose.
+    //
+    // The obvious gradient is float(coord.x) / float(size.x - 1), and it would
+    // look identical. The checkpoint for this step is a byte-for-byte
+    // comparison against the same formula evaluated on the CPU, and a float
+    // divide is specified to within 2.5 ULP in GLSL while the UNORM conversion
+    // rounds with an implementation-chosen tie rule. The margin works out
+    // about eight times larger than the error at this size, so it would
+    // almost certainly pass -- "almost certainly" is not what a checkpoint is
+    // for.
+    //
+    // Doing the division in integers removes the question. float(r) / 255.0 is
+    // not exact in binary, but it is within a whisker of r/255, and the UNORM
+    // conversion rounds to nearest, so it lands on exactly r. The C++ side
+    // runs the identical integer expression.
+    //
+    // A path tracer's output is genuinely float and will want an HDR format
+    // and a tone map. This is a verification choice for one step, not a
+    // pattern to keep.
+    int r = (coord.x * 255) / (size.x - 1);
+    int g = (coord.y * 255) / (size.y - 1);
+
+    // Blue held at a constant 64 so no texel can come out as step 4's
+    // sentinel (0,0,255,255). Red and green both reach 0 at the top-left
+    // corner, so without this the corner texel would be the sentinel exactly
+    // and "the dispatch never ran" would be indistinguishable from "the
+    // dispatch ran" at the one place it is easiest to look.
+    imageStore(outImage, coord,
+               vec4(float(r) / 255.0, float(g) / 255.0, 64.0 / 255.0, 1.0));
+}
