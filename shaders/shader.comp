@@ -1,7 +1,11 @@
 #version 450
 
-// Phase 5, step 5 -- vulkan-tutorial.com "Compute Shader":
+// Phase 5, steps 5 and 7 -- vulkan-tutorial.com "Compute Shader":
 // https://vulkan-tutorial.com/Compute_Shader
+//
+// Step 7 added the push constant and the scroll it drives. Everything else is
+// step 5's and unchanged: at time == 0 this computes exactly what it did then,
+// which is what keeps the startup self-test byte-exact without a special case.
 //
 // The first shader in this project that is not part of a drawing pipeline.
 // There is no vertex to transform, no triangle, no fragment, no framebuffer.
@@ -45,6 +49,26 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // `writeonly` is a promise that lets the compiler skip read paths. Drop it and
 // this still works; claim it and then call imageLoad and the compile fails.
 layout(binding = 0, rgba8) uniform writeonly image2D outImage;
+
+// PUSH CONSTANTS. A small block of bytes that travels inside the COMMAND
+// BUFFER itself -- not in a buffer, not in a descriptor, not allocated
+// anywhere. vkCmdPushConstants records the value into the command stream, so
+// the number is baked into the recorded commands. There is nothing to
+// allocate, nothing to map, no descriptor to write, and nothing to
+// synchronise: a value recorded into this frame's commands cannot be seen by
+// the frame still executing.
+//
+// The budget is tiny by spec -- at least 128 bytes guaranteed, and the
+// device's real figure is printed at startup. That is the whole trade: no
+// setup cost at all, in exchange for a size measured in dozens of bytes. Four
+// bytes of elapsed time is exactly the shape it is for.
+//
+// The alternative is the uniform buffer step 6 deleted: one buffer per frame
+// in flight, a descriptor each, a persistent mapping, and a write that has to
+// be ordered against the frame still reading the previous value.
+layout(push_constant) uniform PushConstants {
+    float time;
+} push;
 
 void main() {
     // WHERE AM I. gl_GlobalInvocationID is this invocation's position in the
@@ -95,7 +119,27 @@ void main() {
     // A path tracer's output is genuinely float and will want an HDR format
     // and a tone map. This is a verification choice for one step, not a
     // pattern to keep.
-    int r = (coord.x * 255) / (size.x - 1);
+    // THE SCROLL. 120 texels a second, wrapping at the image width, so the
+    // gradient cycles every 800/120 = 6.67 seconds and the wrap shows up as a
+    // hard vertical edge where 255 meets 0 -- motion that is unmistakable
+    // rather than a slow fade nobody can be sure about.
+    //
+    // int() truncates, and so does the C++ (int) cast that mirrors it. Both
+    // sides compute the same float product from the same float push constant,
+    // so the shift they derive is bit-identical and the checkpoint stays
+    // byte-exact at an ARBITRARY animated time, not only at t = 0.
+    //
+    // At time == 0 the shift is 0 and sx is coord.x, which reduces this to
+    // step 5's formula exactly.
+    int shift = int(push.time * 120.0) % size.x;
+
+    // Only x scrolls. y is deliberately left alone so the two axes stay
+    // distinguishable: a bug that swapped them would turn a horizontal slide
+    // into a vertical one, which is obvious by eye, where a diagonal slide
+    // would hide it.
+    int sx = (coord.x + shift) % size.x;
+
+    int r = (sx * 255) / (size.x - 1);
     int g = (coord.y * 255) / (size.y - 1);
 
     // Blue held at a constant 64 so no texel can come out as step 4's

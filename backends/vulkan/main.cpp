@@ -1,86 +1,117 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 6 -- no tutorial page. The fullscreen triangle, and the step
-// where the drawing path stops having geometry.
+// Phase 5, step 7 -- vulkan-tutorial.com "Compute Shader", the
+// synchronisation half: https://vulkan-tutorial.com/Compute_Shader
 //
-// Closest tutorial reference is the tail of the compute chapter, where the
-// particle positions are drawn; this takes the opposite route and draws
-// nothing at all except the compute output:
-// https://vulkan-tutorial.com/Compute_Shader
+// The last step of the phase, and the one every earlier step was arranged to
+// make necessary. The dispatch moves OUT of its single-time command envelope
+// and INTO the per-frame command buffer, the gradient animates, and the two
+// pipeline barriers that keep the compute write and the fragment read from
+// racing become load-bearing for the first time.
 //
-// THE FIRST VISIBLE PROOF that the compute shader works. The window now shows
-// the gradient, filling it corner to corner: dark blue at the top-left, red at
-// the top-right, green at the bottom-left, yellow at the bottom-right. Every
-// pixel of it was computed by shader.comp and verified byte-for-byte in step 5
-// before it was ever displayed.
+// WHAT CHANGED, AND WHY IT MATTERS. Until now every dispatch, transition and
+// copy went through beginSingleTimeCommands / endSingleTimeCommands, and that
+// ends in vkQueueWaitIdle -- the CPU blocks until the GPU is COMPLETELY IDLE.
+// That orders everything against everything by brute force, which is why no
+// barrier has been needed so far and why none of the synchronisation was real.
+// In a render loop it is not available: blocking the CPU on a fully idle GPU
+// every frame would throw away the entire point of frames in flight.
 //
-// A FULLSCREEN TRIANGLE WITH NO VERTEX BUFFER. The pipeline declares zero
-// vertex bindings and zero vertex attributes; the draw call is
-// vkCmdDraw(3, 1, 0, 0); shader.vert has no inputs at all and indexes a
-// three-element constant with gl_VertexIndex.
+// So the ordering has to be expressed instead of waited for, and there are TWO
+// hazards, not one:
 //
-// The idea worth keeping: a draw call decides HOW MANY TIMES the vertex shader
-// runs, and gl_VertexIndex is the loop counter handed to each invocation.
-// Using that counter to address a vertex buffer is a convention, not a rule.
+//   READ-AFTER-WRITE, within a frame. This frame's compute shader writes the
+//   image; this frame's fragment shader reads it. The read must not begin
+//   until the write has completed AND is visible to it.
+//     COMPUTE_SHADER / SHADER_WRITE  ->  FRAGMENT_SHADER / SHADER_READ
 //
-// The triangle is bigger than the screen -- (-1,-1), (3,-1), (-1,3) -- because
-// one primitive covering the whole clip square beats two triangles with a
-// diagonal seam across the middle of the image, and the hardware clips the
-// 75% that falls outside for nothing.
+//   WRITE-AFTER-READ, across frames. The previous frame's fragment shader may
+//   still be reading the image when this frame's compute shader starts
+//   overwriting it -- MAX_FRAMES_IN_FLIGHT is 2, so the previous frame is
+//   genuinely still in flight. Nothing else orders these: the fence only
+//   covers the submission from two frames ago, and the semaphores order
+//   acquire and present, not shader stages.
+//     FRAGMENT_SHADER / SHADER_READ  ->  COMPUTE_SHADER / SHADER_WRITE
 //
-// ONE IMAGE, TWO DESCRIPTOR TYPES, AT THE SAME TIME. The storage image is
-// bound to the compute shader as a writable image2D through
-// VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, and to the fragment shader as a readable
-// sampler2D through VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER. Two set
-// layouts, two descriptor types, one VkImage. That is legal because step 4
-// declared both STORAGE and SAMPLED in its usage flags, and because GENERAL is
-// the one layout permitting a shader write and a sampled read of the same
-// image. It is the concrete reason GENERAL had to be the resting layout.
+// The second is the one that is easy to miss entirely, because the first is
+// the one every tutorial mentions.
 //
-// WHAT WENT. Everything the quad needed, because all of it became dead the
-// moment the triangle replaced it: the Vertex struct and its binding and
-// attribute descriptions, the vertex and index arrays, both buffers, the
-// uniform buffers and their persistent mappings, updateUniformBuffer, the
-// rotation, the checkerboard texture with its generator and its upload and
-// its verification, copyBuffer, copyBufferToImage, and the per-frame
-// descriptor sets. Roughly five hundred lines out against sixty in.
+// THE ASYMMETRY BETWEEN THEM is worth holding onto. A read-after-write needs
+// both an execution dependency and a MEMORY dependency -- the write has to be
+// flushed and the read's caches invalidated, which is what the access masks
+// express. A write-after-read needs only the EXECUTION dependency: nothing
+// has to become visible, the new write simply must not start early. The masks
+// are given anyway, because stating the hazard is what makes the barrier
+// reviewable.
 //
-// Two things deliberately survive the cull:
+// BARRIERS WITH NO LAYOUT TRANSITION. Both of these set oldLayout and
+// newLayout to VK_IMAGE_LAYOUT_GENERAL -- the same value. They change nothing
+// about the image's arrangement; they exist PURELY as dependencies. This is
+// the cleanest possible demonstration that a VkImageMemoryBarrier's two jobs
+// are separable: step 1's barriers did a layout change and a dependency
+// together, and these do the dependency alone. The four mask fields were
+// always the content.
 //
-//   - THE SAMPLER. It was always independent of any image -- filtering and
-//     addressing rules and nothing else -- so deleting the texture left it
-//     intact, and the storage image uses it unchanged. The many-to-many point
-//     from step 2, cashed in for real.
-//   - FOUR IDLE ROWS IN transitionImageLayout. The four involving
-//     SHADER_READ_ONLY_OPTIMAL are now unreachable and are kept anyway,
-//     because the table's value is the COMPARISON between rows: two
-//     transitions ending in the same TRANSFER_SRC_OPTIMAL from two different
-//     starting layouts, sharing no mask, is the clearest statement in this
-//     file that barrier masks are not derivable from layout names.
+// PUSH CONSTANTS, for the animation. Four bytes of elapsed time, recorded into
+// the command buffer by vkCmdPushConstants. Not a buffer, not a descriptor,
+// not allocated anywhere -- the value is baked into the recorded commands, so
+// there is nothing to map, nothing to write a descriptor for, and nothing to
+// synchronise, since a value recorded into this frame's commands cannot be
+// seen by the frame still executing. The budget is tiny (at least 128 bytes
+// guaranteed; the device's real figure is printed at startup), and that is
+// exactly the trade: no setup cost at all, for a size measured in dozens of
+// bytes.
+//
+// It is also the replacement for the uniform buffer step 6 deleted, and
+// deliberately not a rebuild of it. One buffer per frame in flight, a
+// descriptor each, a persistent mapping and a write ordered against the frame
+// still reading it -- all of that for four bytes.
+//
+// startTime came back in this step, one line, after step 6 deleted it for
+// having nothing to animate. Deleting what is dead and re-adding what is
+// needed is cheaper than carrying it, and the churn is one member.
+//
+// TWO CHECKPOINTS, and the second is the phase's best:
+//
+//   1. THE STARTUP SELF-TEST, unchanged from step 5. One dispatch at t = 0
+//      through the old single-time envelope, then all 480,000 texels compared
+//      against the host formula. At t = 0 the scroll's shift is 0 and the
+//      shader reduces exactly to step 5's, so this keeps working with no
+//      special case -- it is now a regression test on the push constant
+//      arriving as zero rather than as garbage.
+//
+//   2. THE POST-LOOP VERIFICATION, which is new and is what makes the
+//      per-frame path provable rather than merely plausible. The time pushed
+//      for the last recorded frame is kept, and after the loop ends and
+//      vkDeviceWaitIdle returns, the image is read back and compared against
+//      the host formula AT THAT TIME. Both sides truncate the same float
+//      product from the same float, so the shift is bit-identical and the
+//      comparison is exact -- at an arbitrary animated time, after thousands
+//      of frames through the real per-frame path.
 //
 // Three traps:
 //
-//   1. WINDING. The triangle is clockwise in Vulkan's y-down framebuffer
-//      space, which is what gets it past the VK_CULL_MODE_BACK_BIT the
-//      rasterizer still has set. Reverse the three positions and the window
-//      is blank with a completely clean validation log.
-//   2. THE V FLIP, and step 3 deferred this question to exactly here. Vulkan's
-//      clip space is y-down and its texture space has (0,0) at the top-left,
-//      so the two agree and no flip is needed: clip (-1,-1) is the window's
-//      top-left and maps to texel (0,0). The compute shader wrote texel (0,0)
-//      with red and green both zero, so the dark corner belongs top-left. Flip
-//      the v and the image renders upside down, reported by nothing -- which
-//      is why the gradient was built with four DIFFERENT corners.
-//   3. THE EMPTY VERTEX INPUT STATE IS STILL REQUIRED. Zeroed, not omitted. A
-//      pipeline always has a vertex input stage, and declaring that it reads
-//      nothing is a different thing from not declaring it.
+//   1. A MISSING BARRIER IS NOT VISUALLY VERIFIABLE HERE. On unified-memory
+//      hardware with a single queue, removing either barrier would very
+//      probably still look correct, because the hazard it guards is one the
+//      hardware happens not to expose. That is precisely what makes this the
+//      defect that ships: it is correct by accident on the machine it was
+//      written on. Neither the screen nor the readback can prove the barriers
+//      are right; the reasoning above is the proof, and the masks are the
+//      part a reviewer checks.
+//   2. A DISPATCH CANNOT BE RECORDED INSIDE A RENDER PASS. The order within
+//      the command buffer is barrier, dispatch, barrier, THEN
+//      vkCmdBeginRenderPass. Compute work and render passes do not nest.
+//   3. THE PUSH CONSTANT RANGE'S stageFlags MUST NAME THE STAGE THAT READS
+//      IT, and vkCmdPushConstants must be given the same stage flags again.
+//      A mismatch between the two, or between either and the shader's
+//      layout(push_constant) block, is not something the compiler can see.
 //
-// Render resolution is now visibly decoupled from window size: an 800x600
-// image is being stretched across whatever the window is, and
-// VK_FILTER_LINEAR is doing real work on nearly every pixel. That is the
-// arrangement a path tracer wants, and step 7 is where the dispatch moves into
-// the frame and the barrier that orders it against this draw becomes
-// necessary.
+// Phase 5 ends here. The renderer is now: a compute shader computes an image
+// into a storage image every frame, two barriers order it against the display,
+// and a three-vertex draw with no geometry puts it on screen. That is the
+// skeleton a GPU path tracer hangs on -- what remains is replacing the
+// gradient with rays.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -229,6 +260,14 @@ public:
         initWindow();
         initVulkan();
         mainLoop();
+
+        // THE PHASE'S LAST CHECKPOINT, and the only one that can speak for the
+        // per-frame path. mainLoop ends in vkDeviceWaitIdle, so every
+        // submission has completed and the image holds the result of the last
+        // recorded frame -- recording immediately precedes submission in
+        // drawFrame, and submissions on one queue complete in order.
+        verifyComputeGradient(lastPushedTime, "after the main loop");
+
         cleanup();
     }
 
@@ -404,6 +443,28 @@ private:
     uint32_t frameCounter = 0;
     std::chrono::steady_clock::time_point frameWindowStart;
 
+    // t = 0 for the animation. Back after step 6 deleted it, because step 6
+    // had nothing left to animate; set at the end of initVulkan so that the
+    // several hundred milliseconds of device and pipeline setup do not count
+    // as elapsed time and the first frame starts at a shift of zero.
+    std::chrono::steady_clock::time_point startTime;
+
+    // The time value pushed for the LAST RECORDED frame, kept so that the
+    // post-loop checkpoint can compare the image against the host formula at
+    // exactly that time. Recording always immediately precedes submission in
+    // drawFrame, and submissions on one queue complete in order, so after
+    // vkDeviceWaitIdle the image holds the result of this value and no other.
+    //
+    // A float rather than a double on purpose: it is the same float that was
+    // pushed, so the shift derived from it on the host is bit-identical to the
+    // one the shader derived.
+    float lastPushedTime = 0.0f;
+
+    // Printed once each on the first recorded frame rather than every frame.
+    // The description is derived from the arguments the barrier was actually
+    // recorded with, which is the opposite of a hand-maintained parallel list.
+    int barriersLogged = 0;
+
     void initWindow() {
         glfwInit();
 
@@ -473,15 +534,20 @@ private:
         createDescriptorPool();
         createDescriptorSets();
 
-        // From the same pool as the graphics sets. Then the dispatch, which
-        // runs ONCE here: the image it writes does not change, so there is
-        // nothing to redo per frame. Step 7 moves it into the frame, which is
-        // when it stops being free.
+        // From the same pool as the graphics set. Then ONE dispatch at
+        // t = 0, which is now the startup self-test rather than the only
+        // dispatch there is -- the per-frame path in recordCommandBuffer
+        // immediately overwrites what it produced.
         createComputeDescriptorSet();
-        dispatchCompute();
+        dispatchCompute(0.0f);
 
         createCommandBuffers();
         createSyncObjects();
+
+        // Last, so that the several hundred milliseconds spent above do not
+        // count as elapsed animation time and the first frame starts at a
+        // shift of zero.
+        startTime = std::chrono::steady_clock::now();
     }
 
     void createInstance() {
@@ -1405,9 +1471,11 @@ private:
     // recorded between the two calls ever differ.
     //
     // Three callers remain: transitionImageLayout, readbackImage and
-    // dispatchCompute. The last is the one step 7 takes away, by moving the
-    // dispatch into the per-frame command buffer where vkQueueWaitIdle is no
-    // longer an acceptable way to order anything.
+    // dispatchCompute -- and as of step 7 that last one is only the startup
+    // self-test. The per-frame dispatch records into the frame's own command
+    // buffer instead, where vkQueueWaitIdle would mean blocking the CPU on a
+    // fully idle GPU every frame and throwing away frames in flight
+    // altogether. Two pipeline barriers do the ordering there.
     VkCommandBuffer beginSingleTimeCommands() {
         // Reuses the render loop's pool. A separate short-lived pool created
         // with TRANSIENT_BIT would let the driver optimise for throwaway
@@ -1458,6 +1526,37 @@ private:
         vkQueueWaitIdle(graphicsAndComputeQueue);
 
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    static std::string pipelineStageString(VkPipelineStageFlags stages) {
+        std::string out;
+        auto add = [&out](const char* name) {
+            if (!out.empty()) {
+                out += "|";
+            }
+            out += name;
+        };
+        if (stages & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) add("TOP_OF_PIPE");
+        if (stages & VK_PIPELINE_STAGE_TRANSFER_BIT) add("TRANSFER");
+        if (stages & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) add("COMPUTE_SHADER");
+        if (stages & VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+            add("FRAGMENT_SHADER");
+        return out.empty() ? "none" : out;
+    }
+
+    static std::string accessFlagsString(VkAccessFlags access) {
+        std::string out;
+        auto add = [&out](const char* name) {
+            if (!out.empty()) {
+                out += "|";
+            }
+            out += name;
+        };
+        if (access & VK_ACCESS_SHADER_READ_BIT) add("SHADER_READ");
+        if (access & VK_ACCESS_SHADER_WRITE_BIT) add("SHADER_WRITE");
+        if (access & VK_ACCESS_TRANSFER_READ_BIT) add("TRANSFER_READ");
+        if (access & VK_ACCESS_TRANSFER_WRITE_BIT) add("TRANSFER_WRITE");
+        return out.empty() ? "0 (none)" : out;
     }
 
     static std::string imageLayoutString(VkImageLayout layout) {
@@ -2066,7 +2165,24 @@ private:
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &computeDescriptorSetLayout;
-        pipelineLayoutInfo.pushConstantRangeCount = 0;
+
+        // THE PUSH CONSTANT RANGE, and it is part of the LAYOUT rather than of
+        // any set: push constants are not descriptors and have no pool, no
+        // allocation and no backing memory. The layout declares an offset, a
+        // size and which stages may read it, and vkCmdPushConstants later
+        // writes the bytes straight into the command buffer.
+        //
+        // stageFlags has to name the stage that actually reads the block, and
+        // vkCmdPushConstants has to be handed the same flags again. Neither
+        // the C++ compiler nor glslc can see a mismatch between those two and
+        // the shader's layout(push_constant) declaration.
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(float);
+
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr,
                                    &computePipelineLayout) != VK_SUCCESS) {
@@ -2122,8 +2238,21 @@ private:
                   << graphicsStateBytes << " B"
                   << "\n\tfixed state: none -- there is no rasterizer to"
                      " configure"
-                  << "\n\trender pass: none, and no subpass index either"
-                  << std::endl;
+                  << "\n\trender pass: none, and no subpass index either";
+
+        // The limit beside the use, as with maxSamplerAnisotropy in step 2.
+        // 128 bytes is the spec's guaranteed minimum and a great deal of
+        // hardware offers exactly that, so a push-constant block is budgeted
+        // in bytes from the start rather than discovered to be too small
+        // later. Four of those bytes are now spent.
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+
+        std::cout << "\n\tpush const:  " << pushConstantRange.size
+                  << " B at offset " << pushConstantRange.offset
+                  << ", COMPUTE stage, of "
+                  << properties.limits.maxPushConstantsSize
+                  << " B this device allows" << std::endl;
 
         vkDestroyShaderModule(device, computeShaderModule, nullptr);
     }
@@ -2176,7 +2305,10 @@ private:
                   << std::endl;
     }
 
-    void dispatchCompute() {
+    // Just the four commands, so that the startup self-test below and the
+    // per-frame path in recordCommandBuffer record the IDENTICAL sequence
+    // rather than two copies of it that can drift apart.
+    void recordComputeDispatch(VkCommandBuffer commandBuffer, float time) {
         // CEILING DIVISION, not RENDER_WIDTH / WORKGROUP_SIZE. A dispatch can
         // only ask for whole workgroups, so any dimension that is not a
         // multiple of the group size needs one more group and a guard in the
@@ -2188,13 +2320,11 @@ private:
         uint32_t groupsY =
             (RENDER_HEIGHT + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 
-        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
         // VK_PIPELINE_BIND_POINT_COMPUTE. A command buffer holds graphics and
         // compute bind points INDEPENDENTLY: binding here disturbs nothing
         // bound at the graphics point, and the same is true of the descriptor
-        // sets below. Step 7 depends on that -- it records a dispatch and a
-        // draw into the same buffer.
+        // set below. That is what lets this be recorded into the same buffer
+        // as the draw.
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                           computePipeline);
 
@@ -2204,42 +2334,129 @@ private:
                                 computePipelineLayout, 0, 1,
                                 &computeDescriptorSet, 0, nullptr);
 
+        // FOUR BYTES, straight into the command buffer. The stage flags must
+        // match the range declared in the pipeline layout, and the layout is
+        // passed rather than the pipeline -- the same distinction as
+        // vkCmdBindDescriptorSets, for the same reason: the layout is the
+        // schema the driver checks against.
+        vkCmdPushConstants(commandBuffer, computePipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float),
+                           &time);
+
         // Three numbers, and they are WORKGROUPS rather than invocations --
         // the single most common thing to get wrong about this call. Asking
         // for 800x600 here would launch 800*600*64 invocations, 64 times the
         // intended work, with 98% of them writing out of bounds and silently
         // discarded. It would still produce a correct-looking image.
         vkCmdDispatch(commandBuffer, groupsX, groupsY, 1);
+    }
 
-        // Ends in vkQueueWaitIdle, which is why nothing in this step needs a
-        // barrier: the CPU does not return until the GPU is entirely idle, so
-        // the compute write is complete before anything reads the image.
+    // A dependency and nothing else. oldLayout and newLayout are both GENERAL
+    // -- the same value -- so this changes nothing about the image and exists
+    // purely to order one stage's access against another's. Step 1's barriers
+    // did a layout change and a dependency together; this is the dependency on
+    // its own, which is the clearest way to see that the four mask fields were
+    // always the real content.
+    void recordStorageImageBarrier(VkCommandBuffer commandBuffer,
+                                   VkPipelineStageFlags srcStage,
+                                   VkAccessFlags srcAccess,
+                                   VkPipelineStageFlags dstStage,
+                                   VkAccessFlags dstAccess,
+                                   const char* hazard) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = storageImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
+
+        // A barrier orders the commands recorded BEFORE it against those
+        // recorded after it -- and, because submissions on one queue begin in
+        // order, also against everything submitted earlier on that queue.
+        // That second half is what lets the write-after-read barrier at the
+        // top of a frame reach back to the PREVIOUS frame's fragment reads.
+        vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, nullptr,
+                             0, nullptr, 1, &barrier);
+
+        // Logged once per barrier, on the first recorded frame, and derived
+        // from the arguments it was actually called with.
+        if (barriersLogged < 2) {
+            barriersLogged++;
+            std::cout << "Frame barrier " << barriersLogged << " (" << hazard
+                      << "):"
+                      << "\n\tsrc:    " << pipelineStageString(srcStage) << " / "
+                      << accessFlagsString(srcAccess)
+                      << "\n\tdst:    " << pipelineStageString(dstStage) << " / "
+                      << accessFlagsString(dstAccess)
+                      << "\n\tlayout: " << imageLayoutString(barrier.oldLayout)
+                      << " -> " << imageLayoutString(barrier.newLayout)
+                      << " (no transition -- a dependency only)" << std::endl;
+        }
+    }
+
+    // THE STARTUP SELF-TEST, and the last user of the single-time envelope for
+    // a dispatch. One dispatch at t = 0, where the shader's scroll reduces to
+    // step 5's formula exactly, then the byte comparison that step 5
+    // established. endSingleTimeCommands ends in vkQueueWaitIdle, so this path
+    // still needs no barrier -- which is precisely why the per-frame path does.
+    void dispatchCompute(float time) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+        recordComputeDispatch(commandBuffer, time);
         endSingleTimeCommands(commandBuffer);
+
+        uint32_t groupsX =
+            (RENDER_WIDTH + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        uint32_t groupsY =
+            (RENDER_HEIGHT + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 
         std::cout << "Compute dispatched: " << groupsX << "x" << groupsY
                   << " workgroups of " << WORKGROUP_SIZE << "x"
                   << WORKGROUP_SIZE << " = "
                   << (groupsX * groupsY * WORKGROUP_SIZE * WORKGROUP_SIZE)
                   << " invocations for "
-                  << (RENDER_WIDTH * RENDER_HEIGHT) << " texels" << std::endl;
+                  << (RENDER_WIDTH * RENDER_HEIGHT) << " texels, time "
+                  << time << " s" << std::endl;
 
-        verifyComputeGradient();
+        verifyComputeGradient(time, "startup self-test");
     }
 
     // The checkpoint this whole phase was shaped around, and the reason
     // readbackImage was written as a helper on its first use in step 1.
-    // Nothing on screen changes in this step, so the only way to know the
-    // dispatch did what it was asked is to compare all 480,000 texels against
-    // the same formula in C++.
+    //
+    // Called twice now: once at startup with t = 0 through the single-time
+    // envelope, and once after the main loop with the time of the LAST
+    // RECORDED FRAME. The second call is what makes the per-frame path
+    // provable instead of merely plausible -- nothing on screen can show that
+    // a dispatch ran with the right push constant and wrote the right texels.
     //
     // What this catches that a picture could not: a transposed coordinate
     // mapping (gl_GlobalInvocationID.yx instead of .xy), an off-by-one in the
     // gradient denominator, a workgroup count that leaves part of the image
-    // untouched, and a dispatch that never ran at all.
-    void verifyComputeGradient() {
+    // untouched, a push constant that arrives as garbage, and a dispatch that
+    // never ran at all.
+    //
+    // What it CANNOT catch is a missing barrier -- see trap 1 at the top of
+    // the file. Said plainly here because a checkpoint that is believed to
+    // cover more than it does is worse than none.
+    void verifyComputeGradient(float time, const char* label) {
         std::vector<uint8_t> actual =
             readbackImage(storageImage, RENDER_WIDTH, RENDER_HEIGHT,
                           VK_IMAGE_LAYOUT_GENERAL);
+
+        // THE SAME TRUNCATION THE SHADER DOES, from the same float. int() in
+        // GLSL and (int) in C++ both truncate toward zero, and the product is
+        // computed from bit-identical inputs in single precision on both
+        // sides, so the two shifts agree exactly rather than nearly.
+        int shift = static_cast<int>(time * 120.0f) %
+                    static_cast<int>(RENDER_WIDTH);
 
         size_t mismatches = 0;
         size_t firstMismatch = 0;
@@ -2247,15 +2464,15 @@ private:
 
         for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
             for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
-                size_t i =
-                    (static_cast<size_t>(y) * RENDER_WIDTH + x) * 4;
+                size_t i = (static_cast<size_t>(y) * RENDER_WIDTH + x) * 4;
 
                 // The identical integer expression shader.comp runs. Written
                 // out rather than shared, because there is no way to share it
                 // -- one copy is GLSL and the other is C++. That duplication
                 // is the real cost of this checkpoint and it is worth naming.
+                uint32_t sx = (x + static_cast<uint32_t>(shift)) % RENDER_WIDTH;
                 uint8_t expected[4] = {
-                    static_cast<uint8_t>((x * 255) / (RENDER_WIDTH - 1)),
+                    static_cast<uint8_t>((sx * 255) / (RENDER_WIDTH - 1)),
                     static_cast<uint8_t>((y * 255) / (RENDER_HEIGHT - 1)), 64,
                     255};
 
@@ -2281,9 +2498,10 @@ private:
             }
         }
 
-        std::cout << "Compute gradient verified: " << actual.size()
-                  << " B read back, " << mismatches << " mismatched byte(s), "
-                  << sentinelTexels << " of "
+        std::cout << "Compute gradient verified (" << label << "): "
+                  << actual.size() << " B read back at time " << time
+                  << " s, shift " << shift << " texels, " << mismatches
+                  << " mismatched byte(s), " << sentinelTexels << " of "
                   << (RENDER_WIDTH * RENDER_HEIGHT)
                   << " texels still hold the sentinel" << std::endl;
 
@@ -2298,12 +2516,14 @@ private:
                                        {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
         for (const auto& p : probes) {
             size_t i = (static_cast<size_t>(p[1]) * RENDER_WIDTH + p[0]) * 4;
+            uint32_t sx =
+                (p[0] + static_cast<uint32_t>(shift)) % RENDER_WIDTH;
             std::cout << "\ttexel (" << p[0] << "," << p[1] << "): "
                       << static_cast<int>(actual[i + 0]) << ","
                       << static_cast<int>(actual[i + 1]) << ","
                       << static_cast<int>(actual[i + 2]) << ","
                       << static_cast<int>(actual[i + 3]) << "  expected "
-                      << ((p[0] * 255) / (RENDER_WIDTH - 1)) << ","
+                      << ((sx * 255) / (RENDER_WIDTH - 1)) << ","
                       << ((p[1] * 255) / (RENDER_HEIGHT - 1)) << ",64,255"
                       << std::endl;
         }
@@ -2500,6 +2720,45 @@ private:
             throw std::runtime_error(
                 "failed to begin recording command buffer!");
         }
+
+        // Elapsed seconds, as a float, which is the value the push constant
+        // carries and the value the post-loop checkpoint compares against.
+        // Kept in a member before it is pushed so that the host and the shader
+        // derive their scroll offset from bit-identical inputs.
+        lastPushedTime = std::chrono::duration<float, std::ratio<1>>(
+                             std::chrono::steady_clock::now() - startTime)
+                             .count();
+
+        // HAZARD 2, WRITE-AFTER-READ, and the one that is easy to miss. The
+        // PREVIOUS frame's fragment shader may still be reading this image --
+        // MAX_FRAMES_IN_FLIGHT is 2, so it is genuinely still in flight, and
+        // nothing else orders these two: the fence only covers the submission
+        // from two frames ago, and the semaphores order acquire and present
+        // rather than shader stages.
+        //
+        // This needs only an EXECUTION dependency. Nothing has to become
+        // visible to anyone; the new write simply must not begin before the
+        // old reads finish. The access masks are stated anyway, because
+        // naming the hazard is what makes the barrier reviewable.
+        recordStorageImageBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, "write-after-read, across frames");
+
+        // The dispatch, recorded BEFORE vkCmdBeginRenderPass because compute
+        // work and render passes do not nest. Same four commands the startup
+        // self-test records, through the same helper.
+        recordComputeDispatch(commandBuffer, lastPushedTime);
+
+        // HAZARD 1, READ-AFTER-WRITE, within this frame. The fragment shader
+        // below must not begin reading until the dispatch above has completed
+        // AND its writes are visible -- which is both an execution dependency
+        // and a MEMORY dependency, and the difference from the barrier above
+        // is exactly that second half.
+        recordStorageImageBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, "read-after-write, within a frame");
 
         VkRenderPassBeginInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
