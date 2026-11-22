@@ -1,0 +1,2 @@
+// GLSL shader sources live here, compiled to SPIR-V with glslc.
+// Empty until Phase 2; git cannot track an empty directory, hence this file.

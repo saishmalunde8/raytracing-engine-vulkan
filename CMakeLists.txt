@@ -1,0 +1,110 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(raytracer_vulkan_backend LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# This file builds the Vulkan backend only. The CPU renderer under src/ is
+# still built with the single clang++ line documented in the README, so the
+# two backends share no build settings and cannot break each other.
+
+# Reads the VULKAN_SDK environment variable set by the SDK's setup-env.sh.
+find_package(Vulkan REQUIRED)
+find_package(glfw3 REQUIRED)
+
+# Header-only maths types (vec2/vec3 here, matrices from Phase 4 on).
+# The CPU renderer has its own vec3 in include/raytracer/ and does not use
+# this; glm is the Vulkan backend's dependency alone.
+find_package(glm REQUIRED)
+
+add_executable(vulkan_backend
+    backends/vulkan/main.cpp
+)
+
+# Imported targets carry their own include paths, libraries and rpath, which
+# is why no -I/-L/-rpath flags appear anywhere in this file.
+target_link_libraries(vulkan_backend PRIVATE
+    Vulkan::Vulkan
+    glfw
+    # glm 1.0 exports glm::glm, which is a real shared library, alongside this
+    # interface target. Only glm's types are used here, so there is nothing to
+    # link against at runtime and the header-only target is the honest one.
+    glm::glm-header-only
+)
+
+# ---- Shader compilation -----------------------------------------------------
+#
+# Vulkan consumes SPIR-V bytecode, never GLSL source, so every shader is
+# compiled ahead of time by glslc. The find_package(Vulkan) above already
+# located it and exposed it as Vulkan_GLSLC_EXECUTABLE, so nothing extra has
+# to be discovered here.
+#
+# Two deviations from the common arrangement, which runs glslc from a
+# hand-written shell script and loads the output from a path relative to the
+# working directory:
+#
+#   1. The build compiles the shaders. They regenerate whenever the GLSL
+#      changes, never need committing, and there is no manual step to forget.
+#   2. The output lands in build/shaders/ rather than the source tree, and its
+#      location is handed to the compiler as SHADER_BINARY_DIR. The executable
+#      then finds its shaders no matter which directory it is launched from.
+
+set(SHADER_BINARY_DIR ${CMAKE_BINARY_DIR}/shaders)
+file(MAKE_DIRECTORY ${SHADER_BINARY_DIR})
+
+set(SHADER_SOURCES
+    shaders/shader.vert
+    shaders/shader.frag
+)
+
+# Named <source>.spv rather than the conventional vert.spv/frag.spv, so the
+# source each one came from stays visible once there are more than two.
+set(SPIRV_BINARIES)
+foreach(SHADER ${SHADER_SOURCES})
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    set(SPIRV ${SHADER_BINARY_DIR}/${SHADER_NAME}.spv)
+
+    add_custom_command(
+        OUTPUT ${SPIRV}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPIRV}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+        COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
+        VERBATIM
+    )
+
+    list(APPEND SPIRV_BINARIES ${SPIRV})
+endforeach()
+
+add_custom_target(shaders DEPENDS ${SPIRV_BINARIES})
+add_dependencies(vulkan_backend shaders)
+
+target_compile_definitions(vulkan_backend PRIVATE
+    SHADER_BINARY_DIR="${SHADER_BINARY_DIR}"
+)
+
+# ---- Phase 5, step 5: the compute shader ------------------------------------
+#
+# Appended as its own block rather than added to SHADER_SOURCES above, because
+# this file's rule is that existing lines are never edited. The cost is one
+# duplicated add_custom_command; the benefit is that everything the compute
+# step needed is visible in one place.
+#
+# Same glslc invocation as the graphics shaders -- the stage is inferred from
+# the .comp extension, so nothing here says "compute" either.
+
+set(COMPUTE_SHADER_SPIRV ${SHADER_BINARY_DIR}/shader.comp.spv)
+
+add_custom_command(
+    OUTPUT ${COMPUTE_SHADER_SPIRV}
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp
+            -o ${COMPUTE_SHADER_SPIRV}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.comp
+    COMMENT "Compiling shader.comp to SPIR-V"
+    VERBATIM
+)
+
+add_custom_target(compute_shader DEPENDS ${COMPUTE_SHADER_SPIRV})
+add_dependencies(vulkan_backend compute_shader)
