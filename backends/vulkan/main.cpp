@@ -1,7 +1,7 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 7 -- vulkan-tutorial.com "Compute Shader", the
-// synchronisation half: https://vulkan-tutorial.com/Compute_Shader
+// Phase 5, step 7 -- the compute dispatch moves into the render loop, and the
+// synchronisation that makes necessary.
 //
 // The last step of the phase, and the one every earlier step was arranged to
 // make necessary. The dispatch moves OUT of its single-time command envelope
@@ -34,7 +34,7 @@
 //     FRAGMENT_SHADER / SHADER_READ  ->  COMPUTE_SHADER / SHADER_WRITE
 //
 // The second is the one that is easy to miss entirely, because the first is
-// the one every tutorial mentions.
+// the one that gets named whenever synchronisation comes up.
 //
 // THE ASYMMETRY BETWEEN THEM is worth holding onto. A read-after-write needs
 // both an execution dependency and a MEMORY dependency -- the write has to be
@@ -171,8 +171,8 @@ const std::vector<const char*> validationLayers = {
 // VK_KHR_portability_subset is the second half of the macOS fix. The instance
 // extension in step 2 said "show me incomplete drivers"; this one says "I
 // acknowledge this specific device is incomplete". The spec requires enabling
-// it on any device that advertises it, and the tutorial does not emphasise
-// that -- omitting it trips validation errors later rather than here.
+// it on any device that advertises it, and that is easy to miss -- omitting
+// it trips validation errors later rather than here.
 const std::vector<const char*> deviceExtensions = {
     // Presenting is a per-device capability, so the swapchain is a DEVICE
     // extension -- unlike the instance-level ones enabled in Phase 1.
@@ -216,10 +216,10 @@ void DestroyDebugUtilsMessengerEXT(
 // Any uint32_t is a valid queue family index, including 0, so there is no
 // number free to mean "not found". optional carries that separately.
 //
-// Deviation from the tutorial, per the roadmap: it looks for a graphics-only
-// family. This backend will submit compute work too, and on Apple Silicon one
-// family serves both, so both bits are required here rather than revisiting
-// this in Phase 3.
+// Deviation from the conventional setup, per the roadmap: the usual search is
+// for a graphics-only family. This backend submits compute work too, and on
+// Apple Silicon one family serves both, so both bits are required here rather
+// than revisiting this in Phase 3.
 struct QueueFamilyIndices {
     std::optional<uint32_t> graphicsAndComputeFamily;
 
@@ -414,18 +414,19 @@ private:
     // Which in-flight slot the next frame uses. Cycles 0, 1, 0, 1...
     uint32_t currentFrame = 0;
 
-    // Deliberate deviation: the tutorial uses ONE render-finished semaphore.
-    // That violates VUID-vkQueueSubmit-pSignalSemaphores-00067, and current
-    // validation layers catch it. A present's wait on a binary semaphore is
-    // only known to have completed once that image is re-acquired, so reusing
-    // one semaphore across three images can signal it while the presentation
-    // engine still holds it. One per swapchain image fixes it, because image
-    // i coming round again is exactly the proof its last present finished.
+    // Deliberate deviation: the conventional setup uses ONE render-finished
+    // semaphore. That violates VUID-vkQueueSubmit-pSignalSemaphores-00067, and
+    // current validation layers catch it. A present's wait on a binary
+    // semaphore is only known to have completed once that image is
+    // re-acquired, so reusing one semaphore across three images can signal it
+    // while the presentation engine still holds it. One per swapchain image
+    // fixes it, because image i coming round again is exactly the proof its
+    // last present finished.
     //
-    // Step 10 deliberately leaves this one alone. The tutorial converts it to
-    // MAX_FRAMES_IN_FLIGHT indexed by currentFrame there, which reintroduces
-    // exactly the violation above -- frames in flight and image count are
-    // independent numbers, and this one belongs to the image.
+    // Step 10 deliberately leaves this one alone. The usual treatment converts
+    // it to MAX_FRAMES_IN_FLIGHT indexed by currentFrame at that point, which
+    // reintroduces exactly the violation above -- frames in flight and image
+    // count are independent numbers, and this one belongs to the image.
     //
     // Belonging to the image also means sharing its lifetime: these are
     // rebuilt with the swapchain in recreateSwapChain(), not kept alongside
@@ -788,12 +789,12 @@ private:
             static_cast<uint32_t>(deviceExtensions.size());
         createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
-        // The tutorial sets device-level layers here "for compatibility with
-        // older implementations". That advice is now out of date: the current
-        // spec requires enabledLayerCount to be 0
-        // (VUID-VkDeviceCreateInfo-enabledLayerCount-12384). Device layers
-        // were removed, not just deprecated; the instance-level layers cover
-        // device calls.
+        // Older guidance sets device-level layers here, for compatibility
+        // with implementations predating the instance-level ones. That advice
+        // is now out of date: the current spec requires enabledLayerCount to
+        // be 0 (VUID-VkDeviceCreateInfo-enabledLayerCount-12384). Device
+        // layers were removed, not just deprecated; the instance-level layers
+        // cover device calls.
         createInfo.enabledLayerCount = 0;
 
         if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) !=
@@ -1433,10 +1434,10 @@ private:
         allocInfo.memoryTypeIndex =
             findMemoryType(memRequirements.memoryTypeBits, properties);
 
-        // One allocation per buffer, as the tutorial does. The device limit
-        // maxMemoryAllocationCount is real and small, so this does not scale
-        // -- engines make a few large allocations and sub-allocate at offsets
-        // instead. Kept naive deliberately; the BVH upload is where it bites.
+        // One allocation per buffer. The device limit maxMemoryAllocationCount
+        // is real and small, so this does not scale -- engines make a few
+        // large allocations and sub-allocate at offsets instead. Kept naive
+        // deliberately; the BVH upload is where it bites.
         if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) !=
             VK_SUCCESS) {
             throw std::runtime_error("failed to allocate memory for: " +
@@ -1479,8 +1480,7 @@ private:
     VkCommandBuffer beginSingleTimeCommands() {
         // Reuses the render loop's pool. A separate short-lived pool created
         // with TRANSIENT_BIT would let the driver optimise for throwaway
-        // buffers, which is the refinement the tutorial mentions and this
-        // does not take.
+        // buffers, which is the obvious refinement and this does not take.
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1598,7 +1598,7 @@ private:
         imageInfo.extent.height = height;
         imageInfo.extent.depth = 1;
 
-        // No mip chain and no array. Generating Mipmaps is one of the chapters
+        // No mip chain and no array. Mipmap generation is one of the topics
         // this project skips: a path tracer samples along rays rather than
         // across a surface at a known screen-space derivative, so the level of
         // detail a mip chain selects has nothing to select from.
@@ -1626,7 +1626,7 @@ private:
         // transfer is needed.
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        // One sample per texel. Multisampling is another skipped chapter --
+        // One sample per texel. Multisampling is another skipped topic --
         // the path tracer antialiases by jittering rays inside the pixel,
         // which is a better answer to the same problem and costs no extra
         // image memory.
@@ -1682,11 +1682,11 @@ private:
     // the layout, and establishing a dependency between what came before and
     // what comes after.
     //
-    // No format parameter, which the tutorial has and does not use at this
-    // point. It is there for depth images, whose aspectMask has to name depth
-    // and possibly stencil instead of colour; Depth buffering is a skipped
-    // chapter, so taking an argument that is ignored would be a worse comment
-    // than this one.
+    // No format parameter, which the conventional signature has and does not
+    // use at this point. It is there for depth images, whose aspectMask has to
+    // name depth and possibly stencil instead of colour; depth buffering is a
+    // skipped topic, so taking an argument that is ignored would be a worse
+    // comment than this one.
     void transitionImageLayout(VkImage image, VkImageLayout oldLayout,
                                VkImageLayout newLayout) {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
@@ -1895,9 +1895,9 @@ private:
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
 
-        // Deliberate deviation -- the tutorial enables this. See the file
-        // header: anisotropy fixes blur on a surface seen at a grazing angle,
-        // this renderer ends up displaying an image face-on at 1:1, and
+        // Deliberate deviation -- the conventional setup enables this. See the
+        // file header: anisotropy fixes blur on a surface seen at a grazing
+        // angle, this renderer ends up displaying an image face-on at 1:1, and
         // VK_TRUE here without the samplerAnisotropy device feature (which
         // createLogicalDevice does not enable) is a validation error rather
         // than a quality setting. maxAnisotropy is ignored while this is
@@ -3155,9 +3155,9 @@ private:
         rasterizer.depthBiasEnable = VK_FALSE;
 
         // Off. It antialiases polygon edges by sampling a pixel several times
-        // and needs a GPU feature. The roadmap skips the Multisampling chapter
-        // outright, because a path tracer antialiases by jittering rays within
-        // the pixel -- which falls out of the sampling it already does.
+        // and needs a GPU feature. The roadmap skips multisampling outright,
+        // because a path tracer antialiases by jittering rays within the pixel
+        // -- which falls out of the sampling it already does.
         VkPipelineMultisampleStateCreateInfo multisampling{};
         multisampling.sType =
             VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -3247,8 +3247,8 @@ private:
         pipelineInfo.pMultisampleState = &multisampling;
 
         // Null because there is no depth or stencil buffer. The roadmap skips
-        // the Depth buffering chapter outright: a path tracer resolves depth
-        // by ray distance, so a z-buffer has nothing to contribute.
+        // depth buffering outright: a path tracer resolves depth by ray
+        // distance, so a z-buffer has nothing to contribute.
         pipelineInfo.pDepthStencilState = nullptr;
 
         pipelineInfo.pColorBlendState = &colorBlending;

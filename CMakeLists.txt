@@ -40,8 +40,9 @@ target_link_libraries(vulkan_backend PRIVATE
 # located it and exposed it as Vulkan_GLSLC_EXECUTABLE, so nothing extra has
 # to be discovered here.
 #
-# Two deviations from the tutorial, which runs glslc from a hand-written shell
-# script and loads the output from a path relative to the working directory:
+# Two deviations from the common arrangement, which runs glslc from a
+# hand-written shell script and loads the output from a path relative to the
+# working directory:
 #
 #   1. The build compiles the shaders. They regenerate whenever the GLSL
 #      changes, never need committing, and there is no manual step to forget.
@@ -57,7 +58,7 @@ set(SHADER_SOURCES
     shaders/shader.frag
 )
 
-# Named <source>.spv rather than the tutorial's vert.spv/frag.spv, so the
+# Named <source>.spv rather than the conventional vert.spv/frag.spv, so the
 # source each one came from stays visible once there are more than two.
 set(SPIRV_BINARIES)
 foreach(SHADER ${SHADER_SOURCES})

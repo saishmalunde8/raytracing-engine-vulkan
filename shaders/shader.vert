@@ -1,6 +1,6 @@
 #version 450
 
-// Phase 5, step 6 -- no tutorial page. The fullscreen triangle.
+// Phase 5, step 6 -- the fullscreen triangle.
 //
 // This shader has NO INPUTS. No `in` declarations, no uniform block, no
 // descriptor of any kind. The pipeline declares zero vertex bindings and zero

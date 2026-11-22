@@ -1,6 +1,6 @@
 #version 450
 
-// Phase 5, step 6 -- no tutorial page. Sampling the compute shader's output.
+// Phase 5, step 6 -- sampling the compute shader's output.
 //
 // Unchanged in substance from step 3: one interpolated coordinate in, one
 // texture() out. What changed is on the other side of the descriptor -- the

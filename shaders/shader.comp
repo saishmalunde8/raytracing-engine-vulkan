@@ -1,7 +1,6 @@
 #version 450
 
-// Phase 5, steps 5 and 7 -- vulkan-tutorial.com "Compute Shader":
-// https://vulkan-tutorial.com/Compute_Shader
+// Phase 5, steps 5 and 7 -- the compute shader.
 //
 // Step 7 added the push constant and the scroll it drives. Everything else is
 // step 5's and unchanged: at time == 0 this computes exactly what it did then,
