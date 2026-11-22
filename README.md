@@ -16,19 +16,32 @@ a handful of tiles across CPU threads.
 
 ## Current Status
 
-**Vulkan foundation — complete.** Instance creation with portability flags, validation
-layers in debug builds, physical device selection and queue family lookup, logical
-device with graphics and compute queues, window surface, swapchain with format and
-present-mode selection, image views, SPIR-V shader modules, fixed-function pipeline
-state, render pass, framebuffers, and a command pool with recorded draw commands.
+**GPU compute path — working end to end.** A compute shader computes an 800×600 image
+into a storage image every frame. Two pipeline barriers order that write against the
+fragment shader's read in both directions — read-after-write within a frame, and
+write-after-read across frames — and a three-vertex draw with no vertex buffer puts
+the result on screen. The render resolution is fixed and independent of the window, so
+resizing stretches the image rather than reallocating anything.
 
-**Renderer port — not yet started.** The path tracer has not been moved to the GPU.
-The CPU implementation under `include/` and `src/` currently runs unchanged, on the CPU.
+**The Vulkan machinery underneath is complete.** Instance and device creation with
+portability flags, validation layers in debug builds, a combined graphics and compute
+queue, swapchain selection and recreation on resize, render pass and framebuffers,
+graphics and compute pipelines, descriptor sets, frames-in-flight synchronisation,
+staged device-local uploads, image layout transitions, samplers, and push constants.
+
+**Renderer port — not yet started.** What the compute shader computes is a gradient,
+not a scene: there is no camera, no ray, no intersection and no material on the GPU.
+The path tracer under `include/` and `src/` still runs unchanged, on the CPU.
 
 This ordering is deliberate: the CPU renderer was brought up to date with importance
 sampling *before* any GPU sampling code was written, so the port targets the current
 algorithm rather than an obsolete one, and has a working reference to be validated
 against.
+
+Vertex buffers, index buffers, uniform buffers and a host-uploaded texture were each
+built along the way and then deliberately removed, once a compute shader became the
+image's source and a storage image replaced the uploaded one. They are in the commit
+history rather than the working tree, which is where the reasoning for them lives too.
 
 ---
 
