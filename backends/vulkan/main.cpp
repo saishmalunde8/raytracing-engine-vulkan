@@ -1,117 +1,140 @@
 // Vulkan backend entry point.
 //
-// Phase 5, step 7 -- the compute dispatch moves into the render loop, and the
-// synchronisation that makes necessary.
+// Phase 6, step 1 -- a hash RNG in the shader.
 //
-// The last step of the phase, and the one every earlier step was arranged to
-// make necessary. The dispatch moves OUT of its single-time command envelope
-// and INTO the per-frame command buffer, the gradient animates, and the two
-// pipeline barriers that keep the compute write and the fragment read from
-// racing become load-bearing for the first time.
+// The first step of the renderer port. Phase 5 ended with the machinery
+// finished and nothing worth computing in it: a compute shader wrote a
+// gradient into a storage image every frame, two barriers ordered that
+// against the display, and a three-vertex draw put it on screen. This step
+// replaces the gradient with the one primitive every other part of a path
+// tracer is built out of -- a random number.
 //
-// WHAT CHANGED, AND WHY IT MATTERS. Until now every dispatch, transition and
-// copy went through beginSingleTimeCommands / endSingleTimeCommands, and that
-// ends in vkQueueWaitIdle -- the CPU blocks until the GPU is COMPLETELY IDLE.
-// That orders everything against everything by brute force, which is why no
-// barrier has been needed so far and why none of the synchronisation was real.
-// In a render loop it is not available: blocking the CPU on a fully idle GPU
-// every frame would throw away the entire point of frames in flight.
+// There is still no camera, no ray, no sphere and no material. The window
+// shows coloured static, and that is the whole visible result.
 //
-// So the ordering has to be expressed instead of waited for, and there are TWO
-// hazards, not one:
+// WHY THE CPU'S GENERATOR CANNOT SIMPLY BE RECOMPILED. include/raytracer/
+// core/rng.h holds a std::mt19937 and a std::uniform_real_distribution per
+// RNG instance, and the Mersenne Twister's state is 624 32-bit words -- about
+// 2.5 KB. In deterministic mode the CPU constructs one instance per
+// pixel-sample, which is free when there are eight threads. Here there are
+// 480,000 invocations in flight, and 480,000 x 2.5 KB is 1.2 GB of state that
+// would have to be initialised before one sample could be drawn, against
+// register and local-memory budgets measured in tens of kilobytes per
+// workgroup. The problem is not that it would be slow. It does not fit.
 //
-//   READ-AFTER-WRITE, within a frame. This frame's compute shader writes the
-//   image; this frame's fragment shader reads it. The read must not begin
-//   until the write has completed AND is visible to it.
-//     COMPUTE_SHADER / SHADER_WRITE  ->  FRAGMENT_SHADER / SHADER_READ
+// WHAT REPLACES IT is a HASH: four bytes of state, advanced and scrambled on
+// each call. One linear congruential step, then a permuting output function
+// that xor-shifts the state by an amount derived from its own high bits
+// before a second multiply -- the PCG construction. Five integer operations.
+// The LCG alone would be unusable (its low bits have short periods and its
+// outputs fall on few hyperplanes); the output function is what makes it
+// pass the tests that cheaper hashes fail. The details are in shader.comp,
+// next to the code.
 //
-//   WRITE-AFTER-READ, across frames. The previous frame's fragment shader may
-//   still be reading the image when this frame's compute shader starts
-//   overwriting it -- MAX_FRAMES_IN_FLIGHT is 2, so the previous frame is
-//   genuinely still in flight. Nothing else orders these: the fence only
-//   covers the submission from two frames ago, and the semaphores order
-//   acquire and present, not shader stages.
-//     FRAGMENT_SHADER / SHADER_READ  ->  COMPUTE_SHADER / SHADER_WRITE
+// WHAT DOES NOT CHANGE IS THE SEEDING. pixelSampleSeed in the shader is a
+// transliteration of pixel_sample_seed in rng.h -- same constants, same
+// operators, same order -- because that function already derives randomness
+// purely from the pixel coordinates and the sample index, which is exactly
+// what a shader needs, having nowhere to keep a stream between invocations.
+// The engine changed; what it is started from did not.
 //
-// The second is the one that is easy to miss entirely, because the first is
-// the one that gets named whenever synchronisation comes up.
+// THE SEEDING SCHEME HAS A DEFECT AND IS PORTED ANYWAY. Its three inputs are
+// combined with XOR, and XOR of scaled indices is not injective:
+// i*1973 ^ j*9277 collides. At 800x600 exactly 26,460 of 480,000 pixels share
+// a seed with another pixel -- 5.5% -- so in deterministic mode those pairs
+// draw the IDENTICAL sample sequence. Across ten samples, 1,513,656 of
+// 4,800,000 (pixel, sample) pairs collide. This is not a porting artefact:
+// deterministic = true is set in src/main.cpp and tools/gallery.cpp, so it is
+// in the CPU renders being produced today. It is scattered rather than
+// clustered, so it reads as slightly less effective sampling rather than as a
+// visible pattern, which is why it has gone unnoticed.
 //
-// THE ASYMMETRY BETWEEN THEM is worth holding onto. A read-after-write needs
-// both an execution dependency and a MEMORY dependency -- the write has to be
-// flushed and the read's caches invalidated, which is what the access masks
-// express. A write-after-read needs only the EXECUTION dependency: nothing
-// has to become visible, the new write simply must not start early. The masks
-// are given anyway, because stating the hazard is what makes the barrier
-// reviewable.
+// It is transliterated flaw and all, for two reasons. This step replaces the
+// engine, not the seeding, and changing both at once would leave neither
+// verifiable. And the scheme is SHARED with the CPU backend -- diverging here
+// would quietly break the property that both backends walk the same sample
+// sequence, which is the whole basis of the end-of-phase comparison. The fix
+// belongs upstream in rng.h, applied to both backends in one change. Until
+// then verifyRngProbe measures the collision count and prints it, so the
+// number is in the log rather than in somebody's memory.
 //
-// BARRIERS WITH NO LAYOUT TRANSITION. Both of these set oldLayout and
-// newLayout to VK_IMAGE_LAYOUT_GENERAL -- the same value. They change nothing
-// about the image's arrangement; they exist PURELY as dependencies. This is
-// the cleanest possible demonstration that a VkImageMemoryBarrier's two jobs
-// are separable: step 1's barriers did a layout change and a dependency
-// together, and these do the dependency alone. The four mask fields were
-// always the content.
+// THE CHECKPOINT IS BIT-EXACT, not statistical, and that was not the plan.
+// A hash RNG looks like a thing you can only test statistically -- draw a lot
+// of numbers, check the mean is near 0.5. That test is weak: it passes for
+// generators with badly correlated outputs, which is the actual failure mode
+// of the one-liners this replaces. It turns out not to be necessary, because
+// EVERY OPERATION IN THE GENERATOR IS EXACT. The hash is integer arithmetic
+// with defined wraparound. The float conversion takes a value below 2^24
+// (exactly representable) and multiplies by 2^-24 (a power of two, so only
+// the exponent moves). Nothing rounds anywhere. So the host can predict all
+// 1,920,000 floats bit for bit, and the checkpoint is the same kind of
+// comparison the gradient had: zero mismatched bytes, or a failure.
 //
-// PUSH CONSTANTS, for the animation. Four bytes of elapsed time, recorded into
-// the command buffer by vkCmdPushConstants. Not a buffer, not a descriptor,
-// not allocated anywhere -- the value is baked into the recorded commands, so
-// there is nothing to map, nothing to write a descriptor for, and nothing to
-// synchronise, since a value recorded into this frame's commands cannot be
-// seen by the frame still executing. The budget is tiny (at least 128 bytes
-// guaranteed; the device's real figure is printed at startup), and that is
-// exactly the trade: no setup cost at all, for a size measured in dozens of
-// bytes.
+// That answers FIDELITY -- did the shader compute what was intended. It says
+// nothing about QUALITY -- is what was intended any good. Those are different
+// questions and the statistics are kept for the second one: range, mean,
+// variance, a chi-square over sixteen buckets, and the correlation between
+// consecutive draws in a stream, which is the one that would catch a
+// plausible-looking hash whose outputs march.
 //
-// It is also the replacement for the uniform buffer step 6 deleted, and
-// deliberately not a rebuild of it. One buffer per frame in flight, a
-// descriptor each, a persistent mapping and a write ordered against the frame
-// still reading it -- all of that for four bytes.
+// THE PROBE BUFFER is the first shader storage buffer in this project, and it
+// exists because the comparison above cannot be done through the image. An
+// R8G8B8A8_UNORM storage image has 256 distinguishable values per channel, it
+// CLAMPS anything outside [0,1] rather than reporting it, and its
+// float-to-byte rounding has an implementation-chosen tie rule -- so it can
+// neither carry a float faithfully nor reveal one that left the interval. A
+// buffer of vec4 delivers the bits the shader stored. It is host-visible and
+// mapped once for its whole life, which is the right trade for a diagnostic:
+// no staging copy, no transfer, read directly once the device is idle. Real
+// render data would be device-local with a staged upload.
 //
-// startTime came back in this step, one line, after step 6 deleted it for
-// having nothing to animate. Deleting what is dead and re-adding what is
-// needed is cheaper than carrying it, and the churn is one member.
+// Six traps:
 //
-// TWO CHECKPOINTS, and the second is the phase's best:
+//   1. CONSTANTS THAT MUST AGREE ACROSS THE HOST/SHADER BOUNDARY, WITH
+//      NOTHING CHECKING THAT THEY DO. WORKGROUP_SIZE against local_size_x/y
+//      was the first. This step adds the worst case yet: the three hash
+//      constants, the shift amounts and the number of draws per pixel are
+//      written twice, once in GLSL and once in C++, compiled by different
+//      compilers, and the two copies are the checkpoint comparing itself
+//      against itself. A matched pair of edits is invisible; a mismatched one
+//      shows up as a total mismatch rather than a subtle one, which is the
+//      only mercy available. The duplication is unavoidable -- there is no
+//      language in which both sides could be written once -- and naming it is
+//      the mitigation.
+//   2. FORMAT FEATURES ARE NOT GUARANTEED. What a VkFormat may be used for
+//      varies by device and by tiling, and must be queried. A guaranteed
+//      format is queried anyway, because the query is the habit worth having.
+//      R32G32B32A32_SFLOAT is probed here too, ahead of needing it: Phase 7
+//      accumulates into a float image, and STORAGE_IMAGE_ATOMIC turned out
+//      unsupported for R8G8B8A8_UNORM on this device.
+//   3. VkClearColorValue IS float32 REGARDLESS OF THE IMAGE'S BIT DEPTH.
+//      The union has an integer member and it is the wrong one for a UNORM
+//      image: 0-255 bytes go in as 0.0-1.0 floats.
+//   4. RENDER RESOLUTION IS NOT WINDOW SIZE. The storage image is fixed at
+//      800x600 and stretched across whatever the window is, so resizing
+//      reallocates nothing. A path tracer wants exactly this.
+//   5. A MISSING BARRIER IS STILL NOT VISUALLY VERIFIABLE. On unified-memory
+//      hardware with a single queue, removing either of the two barriers
+//      around the dispatch would very probably still look correct, because
+//      the hazard it guards is one this device happens not to expose. That is
+//      what makes it the defect that ships: correct by accident on the machine
+//      it was written on. Neither the screen nor any readback can prove the
+//      barriers are right -- the reasoning in recordStorageImageBarrier is the
+//      proof, and the access masks are the part a reviewer checks.
+//   6. THE NAIVE uint-TO-FLOAT CONVERSION RETURNS 1.0, and [0,1) is a
+//      contract the samplers depend on. float(u) * (1.0/4294967296.0) gives
+//      exactly 1.0 for every u from 2^32 - 128 upward, because a float's
+//      representable values are 256 apart at that magnitude. About one draw
+//      in 2^25 -- often enough to appear every few seconds in a render, rare
+//      enough that no casual test sees it. Downstream, 1.0 reaches
+//      sqrt(1 - r2) in the cosine-weighted direction as exactly zero, and an
+//      acos or a 1/(1-r) elsewhere as infinity or a NaN that spreads through
+//      a pixel's whole path. Using the top 24 bits removes the case instead
+//      of narrowing it.
 //
-//   1. THE STARTUP SELF-TEST, unchanged from step 5. One dispatch at t = 0
-//      through the old single-time envelope, then all 480,000 texels compared
-//      against the host formula. At t = 0 the scroll's shift is 0 and the
-//      shader reduces exactly to step 5's, so this keeps working with no
-//      special case -- it is now a regression test on the push constant
-//      arriving as zero rather than as garbage.
-//
-//   2. THE POST-LOOP VERIFICATION, which is new and is what makes the
-//      per-frame path provable rather than merely plausible. The time pushed
-//      for the last recorded frame is kept, and after the loop ends and
-//      vkDeviceWaitIdle returns, the image is read back and compared against
-//      the host formula AT THAT TIME. Both sides truncate the same float
-//      product from the same float, so the shift is bit-identical and the
-//      comparison is exact -- at an arbitrary animated time, after thousands
-//      of frames through the real per-frame path.
-//
-// Three traps:
-//
-//   1. A MISSING BARRIER IS NOT VISUALLY VERIFIABLE HERE. On unified-memory
-//      hardware with a single queue, removing either barrier would very
-//      probably still look correct, because the hazard it guards is one the
-//      hardware happens not to expose. That is precisely what makes this the
-//      defect that ships: it is correct by accident on the machine it was
-//      written on. Neither the screen nor the readback can prove the barriers
-//      are right; the reasoning above is the proof, and the masks are the
-//      part a reviewer checks.
-//   2. A DISPATCH CANNOT BE RECORDED INSIDE A RENDER PASS. The order within
-//      the command buffer is barrier, dispatch, barrier, THEN
-//      vkCmdBeginRenderPass. Compute work and render passes do not nest.
-//   3. THE PUSH CONSTANT RANGE'S stageFlags MUST NAME THE STAGE THAT READS
-//      IT, and vkCmdPushConstants must be given the same stage flags again.
-//      A mismatch between the two, or between either and the shader's
-//      layout(push_constant) block, is not something the compiler can see.
-//
-// Phase 5 ends here. The renderer is now: a compute shader computes an image
-// into a storage image every frame, two barriers order it against the display,
-// and a three-vertex draw with no geometry puts it on screen. That is the
-// skeleton a GPU path tracer hangs on -- what remains is replacing the
-// gradient with rays.
+// Next: a camera uniform and ray generation, which brings back a uniform
+// buffer and with it std140's padding rules -- the layout std430 above does
+// not have.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -261,12 +284,16 @@ public:
         initVulkan();
         mainLoop();
 
-        // THE PHASE'S LAST CHECKPOINT, and the only one that can speak for the
-        // per-frame path. mainLoop ends in vkDeviceWaitIdle, so every
-        // submission has completed and the image holds the result of the last
-        // recorded frame -- recording immediately precedes submission in
-        // drawFrame, and submissions on one queue complete in order.
-        verifyComputeGradient(lastPushedTime, "after the main loop");
+        // THE CHECKPOINT THAT SPEAKS FOR THE PER-FRAME PATH. mainLoop ends
+        // in vkDeviceWaitIdle, so every submission has completed and both the
+        // image and the probe buffer hold the result of the last recorded
+        // frame -- recording immediately precedes submission in drawFrame, and
+        // submissions on one queue complete in order.
+        //
+        // The probe needs no invalidate before it is read: its memory is
+        // HOST_COHERENT, so the GPU's writes are visible to the host as soon
+        // as the submission that made them completes.
+        verifyRngProbe(lastPushedTime, "after the main loop");
 
         cleanup();
     }
@@ -402,6 +429,32 @@ private:
     // compilers, and a disagreement is silent -- see trap 1 at the top.
     static const uint32_t WORKGROUP_SIZE = 8;
 
+    // Phase 6 step 1. The probe buffer: every float the shader drew, at full
+    // precision, for the host checkpoint to compare against its own
+    // reference. Not a render target and not on the display path.
+    VkBuffer rngProbeBuffer;
+    VkDeviceMemory rngProbeMemory;
+
+    // Mapped at creation and left mapped until cleanup. A persistent mapping
+    // costs nothing on this hardware, and map/read/unmap around each
+    // checkpoint would be three calls to achieve the same thing.
+    void* rngProbeMapped = nullptr;
+
+    // MUST MATCH the number of nextFloat() calls in shader.comp -- the shader
+    // advances its state once per call, so a disagreement here shifts every
+    // value after the first. See trap 1 at the top of the file.
+    static const uint32_t RNG_DRAWS_PER_PIXEL = 4;
+
+    // What the probe holds before any dispatch writes it, serving the same
+    // purpose as STORAGE_SENTINEL above: it distinguishes "the shader never
+    // wrote this" from "the shader wrote the wrong thing". Outside [0,1), so
+    // it fails the range test too rather than only the comparison.
+    static constexpr float RNG_PROBE_SENTINEL = -1.0f;
+
+    // Buckets for the chi-square over [0,1). Sixteen leaves 120,000 values
+    // expected in each, which is enough for the statistic to be tight.
+    static const int RNG_BUCKETS = 16;
+
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
     // opposite tool: it is how the CPU waits for the GPU to finish.
@@ -531,6 +584,11 @@ private:
         // After the command pool, which its transition and its clear submit
         // through. The only image left in the program.
         createStorageImage();
+
+        // Before the compute descriptor set, which points at it. Nothing else
+        // depends on it: it is not on the display path and no pipeline is
+        // built from it.
+        createRngProbeBuffer();
 
         createDescriptorPool();
         createDescriptorSets();
@@ -1987,6 +2045,34 @@ private:
                 "R8G8B8A8_UNORM cannot be used as a storage image");
         }
 
+        // PROBED AHEAD OF BEING NEEDED, which is the cheap half of trap 2.
+        // Phase 7 accumulates samples into a float image, and whether that
+        // can use atomics is decided by this query. Asking now costs one call
+        // while format properties are already being printed; finding out in
+        // Phase 7 costs a redesign. Nothing here uses the answer yet, and the
+        // image below is still R8G8B8A8_UNORM.
+        VkFormatProperties hdrProperties;
+        vkGetPhysicalDeviceFormatProperties(
+            physicalDevice, VK_FORMAT_R32G32B32A32_SFLOAT, &hdrProperties);
+        VkFormatFeatureFlags hdrFeatures = hdrProperties.optimalTilingFeatures;
+
+        std::cout << "Format R32G32B32A32_SFLOAT at OPTIMAL tiling: "
+                     "STORAGE_IMAGE "
+                  << ((hdrFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+                          ? "yes"
+                          : "no")
+                  << ", SAMPLED_IMAGE "
+                  << ((hdrFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+                          ? "yes"
+                          : "no")
+                  << ", STORAGE_IMAGE_ATOMIC "
+                  << ((hdrFeatures &
+                       VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)
+                          ? "yes"
+                          : "no")
+                  << "  (unused in this step -- Phase 7 accumulates here)"
+                  << std::endl;
+
         // Four usage flags, and each one's reason is worth stating because a
         // missing flag is not caught here -- it is caught at the command that
         // needed it, which may be steps away:
@@ -2109,6 +2195,58 @@ private:
         }
     }
 
+    // Phase 6 step 1. The buffer the checkpoint reads, and the first SHADER
+    // STORAGE BUFFER in this project.
+    void createRngProbeBuffer() {
+        VkDeviceSize size = static_cast<VkDeviceSize>(RENDER_WIDTH) *
+                            RENDER_HEIGHT * RNG_DRAWS_PER_PIXEL *
+                            sizeof(float);
+
+        // HOST_VISIBLE and HOST_COHERENT, where every buffer the renderer
+        // itself used was DEVICE_LOCAL behind a staged transfer. The reasoning
+        // inverts because the direction does: a vertex buffer is written once
+        // by the host and read constantly by the GPU, so it belongs in the
+        // fastest memory the GPU has and pays one copy to get there. This is
+        // written by the GPU and read once by the host, by a checkpoint that
+        // runs when the device is idle and does not care how fast it is.
+        // Host-visible means no staging buffer, no transfer command and no
+        // barrier -- the mapped pointer simply holds the answer.
+        //
+        // HOST_COHERENT is the half that is easy to forget. Without it the
+        // host's view of this memory could be stale after the GPU wrote it,
+        // and vkInvalidateMappedMemoryRanges would be needed before every
+        // read. With it the write is visible as soon as the submission
+        // completes, which is why the checkpoint reads the pointer directly.
+        createBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     rngProbeBuffer, rngProbeMemory, "RNG probe buffer");
+
+        if (vkMapMemory(device, rngProbeMemory, 0, size, 0, &rngProbeMapped) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("failed to map the RNG probe buffer!");
+        }
+
+        // POISONED, for the same reason the storage image is cleared to a
+        // sentinel before anything writes it. An all-zero buffer that is never
+        // written reads as 0.0 everywhere, which is a legal draw -- so a
+        // dispatch that silently did not run would look like a generator stuck
+        // at zero rather than like a dispatch that did not run. -1.0 cannot be
+        // produced by nextFloat and is reported separately from a mismatch.
+        float* poison = static_cast<float*>(rngProbeMapped);
+        size_t count = static_cast<size_t>(size) / sizeof(float);
+        for (size_t i = 0; i < count; i++) {
+            poison[i] = RNG_PROBE_SENTINEL;
+        }
+
+        std::cout << "RNG probe buffer: " << size << " B = "
+                  << (static_cast<size_t>(RENDER_WIDTH) * RENDER_HEIGHT)
+                  << " pixels x " << RNG_DRAWS_PER_PIXEL
+                  << " floats, host-visible and mapped at " << rngProbeMapped
+                  << ", filled with the sentinel " << RNG_PROBE_SENTINEL
+                  << std::endl;
+    }
+
     void createComputeDescriptorSetLayout() {
         VkDescriptorSetLayoutBinding storageImageBinding{};
         storageImageBinding.binding = 0;
@@ -2124,11 +2262,35 @@ private:
         storageImageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         storageImageBinding.pImmutableSamplers = nullptr;
 
+        // Phase 6 step 1. STORAGE_BUFFER, and the type is what grants write
+        // access just as it did for the image above. UNIFORM_BUFFER -- the
+        // type step 6 deleted -- is read-only to the shader however the
+        // memory was allocated, and is size-limited besides: the guaranteed
+        // maximum range for a uniform buffer is 16 KB, against 128 MB for a
+        // storage buffer. 7.68 MB of probe would not fit in one.
+        //
+        // That size limit is the real reason the scene data arriving in
+        // Phase 8 will be storage buffers rather than uniform ones, and this
+        // binding is the first instance of the type.
+        VkDescriptorSetLayoutBinding probeBufferBinding{};
+        probeBufferBinding.binding = 1;
+        probeBufferBinding.descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        probeBufferBinding.descriptorCount = 1;
+        probeBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        probeBufferBinding.pImmutableSamplers = nullptr;
+
+        // The binding NUMBERS are what the shader's layout(binding = N)
+        // matches, not the order in this array. They happen to agree here;
+        // relying on that would be a bug waiting for the day they do not.
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {
+            storageImageBinding, probeBufferBinding};
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &storageImageBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
                                         &computeDescriptorSetLayout) !=
@@ -2137,8 +2299,10 @@ private:
                 "failed to create compute descriptor set layout!");
         }
 
-        std::cout << "Compute descriptor set layout: 1 binding"
+        std::cout << "Compute descriptor set layout: " << bindings.size()
+                  << " bindings"
                   << "\n\tbinding 0: STORAGE_IMAGE x1, COMPUTE stage"
+                  << "\n\tbinding 1: STORAGE_BUFFER x1, COMPUTE stage"
                   << "\n\tnamespace: separate from the graphics layout's"
                      " binding 0"
                   << std::endl;
@@ -2285,23 +2449,49 @@ private:
         // descriptorType below, exactly as pBufferInfo/pImageInfo are.
         imageInfo.sampler = VK_NULL_HANDLE;
 
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = computeDescriptorSet;
-        write.dstBinding = 0;
-        write.dstArrayElement = 0;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        write.descriptorCount = 1;
-        write.pImageInfo = &imageInfo;
+        // Phase 6 step 1. pBufferInfo rather than pImageInfo, and the
+        // descriptorType below is what decides which of the two the driver
+        // reads -- the same rule the ignored sampler field above follows.
+        //
+        // VK_WHOLE_SIZE rather than the byte count. The buffer is used in its
+        // entirety and the range is not a thing the shader can see: the
+        // unsized array in the shader's buffer block takes its length from
+        // the bound range, so passing a short range here would silently
+        // shorten draws[] rather than fail.
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = rngProbeBuffer;
+        bufferInfo.offset = 0;
+        bufferInfo.range = VK_WHOLE_SIZE;
 
-        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        std::array<VkWriteDescriptorSet, 2> writes{};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = computeDescriptorSet;
+        writes[0].dstBinding = 0;
+        writes[0].dstArrayElement = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo = &imageInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = computeDescriptorSet;
+        writes[1].dstBinding = 1;
+        writes[1].dstArrayElement = 0;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].descriptorCount = 1;
+        writes[1].pBufferInfo = &bufferInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
 
         std::cout << "Compute descriptor set written:"
                   << "\n\tbinding 0 -> view " << storageImageView
                   << ", sampler none, layout "
                   << imageLayoutString(VK_IMAGE_LAYOUT_GENERAL)
-                  << "\n\tsets:       1, not one per frame -- the image it"
-                     " points at never changes"
+                  << "\n\tbinding 1 -> buffer " << rngProbeBuffer
+                  << ", offset 0, range VK_WHOLE_SIZE"
+                  << "\n\tsets:       1, not one per frame -- neither the"
+                     " image nor the buffer it points at ever changes"
                   << std::endl;
     }
 
@@ -2425,114 +2615,365 @@ private:
                   << (RENDER_WIDTH * RENDER_HEIGHT) << " texels, time "
                   << time << " s" << std::endl;
 
-        verifyComputeGradient(time, "startup self-test");
+        verifyRngProbe(time, "startup self-test");
     }
 
-    // The checkpoint this whole phase was shaped around, and the reason
-    // readbackImage was written as a helper on its first use in step 1.
+    // THE HOST REFERENCE FOR THE SHADER'S GENERATOR, written out operator
+    // for operator. These three functions and their counterparts in
+    // shader.comp are one algorithm expressed twice, in two languages, built
+    // by two compilers -- and the checkpoint below is the two copies checking
+    // each other. That is trap 1 in its sharpest form, and there is no
+    // arrangement that avoids it: nothing can be shared between a .comp and a
+    // .cpp. An edit to one that is not mirrored in the other shows up as a
+    // total mismatch rather than a subtle one, which is the only help the
+    // situation offers.
     //
-    // Called twice now: once at startup with t = 0 through the single-time
-    // envelope, and once after the main loop with the time of the LAST
-    // RECORDED FRAME. The second call is what makes the per-frame path
-    // provable instead of merely plausible -- nothing on screen can show that
-    // a dispatch ran with the right push constant and wrote the right texels.
+    // uint32_t is unsigned, so both multiplies wrap modulo 2^32 exactly as
+    // GLSL's do. Unsigned overflow being DEFINED in C++ -- unlike signed
+    // overflow, which is undefined behaviour -- is the property this leans on.
+    static uint32_t hostNextUint(uint32_t& state) {
+        state = state * 747796405u + 2891336453u;
+        uint32_t word =
+            ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        return (word >> 22u) ^ word;
+    }
+
+    // The top 24 bits divided by 2^24, and the reason this comparison can be
+    // exact at all. The numerator is below 2^24 so it converts to float
+    // without loss; the denominator is a power of two so the multiply moves
+    // the exponent and rounds nothing. No operation anywhere in the generator
+    // is inexact, which is why the host can predict every bit. See trap 6 for
+    // what the obvious version does instead.
+    static float hostNextFloat(uint32_t& state) {
+        return static_cast<float>(hostNextUint(state) >> 8) *
+               (1.0f / 16777216.0f);
+    }
+
+    // pixel_sample_seed from include/raytracer/core/rng.h, which shader.comp
+    // also transliterates. Ported with its collision flaw intact -- see the
+    // file header for the measurement and the reasoning.
+    static uint32_t hostPixelSampleSeed(int i, int j, int sampleIndex) {
+        uint32_t seed = 0;
+        seed ^= static_cast<uint32_t>(i) * 1973u;
+        seed ^= static_cast<uint32_t>(j) * 9277u;
+        seed ^= static_cast<uint32_t>(sampleIndex) * 26699u;
+        seed += 1u;
+        return seed;
+    }
+
+    // THE CHECKPOINT FOR THIS STEP, and it answers two separate questions.
     //
-    // What this catches that a picture could not: a transposed coordinate
-    // mapping (gl_GlobalInvocationID.yx instead of .xy), an off-by-one in the
-    // gradient denominator, a workgroup count that leaves part of the image
-    // untouched, a push constant that arrives as garbage, and a dispatch that
-    // never ran at all.
+    // FIDELITY, by exact comparison: all 1,920,000 floats against the host
+    // reference above, bit for bit. This is possible because the generator is
+    // exact throughout, and it is what catches a wrong constant, a wrong shift
+    // amount, a draw count that disagrees, a seed built from the wrong
+    // coordinates, a transposed index, a dispatch that missed part of the
+    // image, and a push constant that arrived as garbage.
     //
-    // What it CANNOT catch is a missing barrier -- see trap 1 at the top of
-    // the file. Said plainly here because a checkpoint that is believed to
-    // cover more than it does is worse than none.
-    void verifyComputeGradient(float time, const char* label) {
-        std::vector<uint8_t> actual =
-            readbackImage(storageImage, RENDER_WIDTH, RENDER_HEIGHT,
-                          VK_IMAGE_LAYOUT_GENERAL);
+    // QUALITY, by statistics: whether what the shader faithfully computed is
+    // actually uniform and uncorrelated. A perfectly faithful port of a bad
+    // generator passes the first test and fails these.
+    //
+    // Replaces verifyComputeGradient, which compared the same image against a
+    // gradient formula. The gradient is gone; the shape of the checkpoint --
+    // read everything back, recompute it on the host, compare exactly -- is
+    // the part worth keeping, and this is the same idea through a buffer
+    // instead of an image.
+    //
+    // What it still CANNOT catch is a missing barrier. See trap 5: on this
+    // hardware both barriers could be deleted and every number here would
+    // very likely still be right.
+    void verifyRngProbe(float time, const char* label) {
+        // THRESHOLDS, each a multiple of the actual sampling error rather than
+        // a round number. Over 1,920,000 values the standard error of the mean
+        // is sqrt((1/12)/n) = 2.1e-4, so 2e-3 is about nine sigma. The
+        // standard deviation of the sample variance is 5.4e-5, so 1e-3 is
+        // about eighteen. The 99.9th percentile of chi-square at 15 degrees of
+        // freedom is 37.7. The standard error of a correlation over 1,440,000
+        // pairs is 8.3e-4, so 0.01 is about twelve sigma.
+        //
+        // Deliberately loose, because the failures these exist to catch are
+        // gross: a generator with marching outputs scores a correlation in the
+        // tenths, and a biased one scores chi-square in the thousands. A false
+        // failure would be worse than a missed subtle bias, and nothing subtle
+        // can get past the exact comparison anyway.
+        //
+        // The values are not quite independent: 5.5% of pixels share a seed,
+        // so some numbers appear twice. That inflates each statistic by
+        // roughly 5%, which these margins absorb.
+        constexpr double MEAN_TOLERANCE = 2e-3;
+        constexpr double VARIANCE_TOLERANCE = 1e-3;
+        constexpr double CHI_SQUARE_LIMIT = 50.0;
+        constexpr double SERIAL_LIMIT = 0.01;
 
         // THE SAME TRUNCATION THE SHADER DOES, from the same float. int() in
         // GLSL and (int) in C++ both truncate toward zero, and the product is
         // computed from bit-identical inputs in single precision on both
-        // sides, so the two shifts agree exactly rather than nearly.
-        int shift = static_cast<int>(time * 120.0f) %
-                    static_cast<int>(RENDER_WIDTH);
+        // sides, so the two sample indices agree exactly rather than nearly.
+        int sampleIndex = static_cast<int>(time * 60.0f);
+
+        const size_t pixels =
+            static_cast<size_t>(RENDER_WIDTH) * RENDER_HEIGHT;
+        const size_t values = pixels * RNG_DRAWS_PER_PIXEL;
+        const float* actual = static_cast<const float*>(rngProbeMapped);
 
         size_t mismatches = 0;
+        size_t sentinels = 0;
         size_t firstMismatch = 0;
-        size_t sentinelTexels = 0;
+        float firstActual = 0.0f;
+        float firstExpected = 0.0f;
+
+        size_t outOfRange = 0;
+        float minValue = 2.0f;
+        float maxValue = -2.0f;
+        double sum = 0.0;
+        double sumSquares = 0.0;
+        double serialSum = 0.0;
+        std::array<size_t, RNG_BUCKETS> bucketCounts{};
 
         for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
             for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
-                size_t i = (static_cast<size_t>(y) * RENDER_WIDTH + x) * 4;
+                uint32_t state = hostPixelSampleSeed(
+                    static_cast<int>(x), static_cast<int>(y), sampleIndex);
+                size_t base = (static_cast<size_t>(y) * RENDER_WIDTH + x) *
+                              RNG_DRAWS_PER_PIXEL;
 
-                // The identical integer expression shader.comp runs. Written
-                // out rather than shared, because there is no way to share it
-                // -- one copy is GLSL and the other is C++. That duplication
-                // is the real cost of this checkpoint and it is worth naming.
-                uint32_t sx = (x + static_cast<uint32_t>(shift)) % RENDER_WIDTH;
-                uint8_t expected[4] = {
-                    static_cast<uint8_t>((sx * 255) / (RENDER_WIDTH - 1)),
-                    static_cast<uint8_t>((y * 255) / (RENDER_HEIGHT - 1)), 64,
-                    255};
+                for (uint32_t d = 0; d < RNG_DRAWS_PER_PIXEL; d++) {
+                    float expected = hostNextFloat(state);
+                    float got = actual[base + d];
 
-                for (int c = 0; c < 4; c++) {
-                    if (actual[i + c] != expected[c]) {
+                    // EXACT float comparison, which is almost always a
+                    // mistake and is the point here: there is no rounding
+                    // anywhere in either implementation, so anything other
+                    // than equality is a real disagreement. A NaN compares
+                    // unequal to itself and is counted, which is correct.
+                    if (got != expected) {
                         if (mismatches == 0) {
-                            firstMismatch = i + c;
+                            firstMismatch = base + d;
+                            firstActual = got;
+                            firstExpected = expected;
                         }
                         mismatches++;
                     }
-                }
 
-                // Counted separately from the mismatches, because "still the
-                // sentinel" and "wrong value" are different diagnoses: the
-                // first means the dispatch did not reach this texel, the
-                // second that it reached it and computed the wrong thing.
-                if (actual[i + 0] == STORAGE_SENTINEL[0] &&
-                    actual[i + 1] == STORAGE_SENTINEL[1] &&
-                    actual[i + 2] == STORAGE_SENTINEL[2] &&
-                    actual[i + 3] == STORAGE_SENTINEL[3]) {
-                    sentinelTexels++;
+                    // Counted separately, because "never written" and "wrong
+                    // value" are different diagnoses.
+                    if (got == RNG_PROBE_SENTINEL) {
+                        sentinels++;
+                    }
+
+                    // Everything below judges the SHADER'S value, not the
+                    // host's. Fidelity is settled above; these answer whether
+                    // the thing both sides agree on is any good.
+                    if (!(got >= 0.0f && got < 1.0f)) {
+                        outOfRange++;
+                    }
+                    minValue = std::min(minValue, got);
+                    maxValue = std::max(maxValue, got);
+                    sum += got;
+                    sumSquares += static_cast<double>(got) * got;
+
+                    int bucket = static_cast<int>(got * RNG_BUCKETS);
+                    bucket = std::max(0, std::min(RNG_BUCKETS - 1, bucket));
+                    bucketCounts[static_cast<size_t>(bucket)]++;
+
+                    // Consecutive draws WITHIN one pixel's stream, which is
+                    // the axis that matters: a hash whose successive outputs
+                    // march would still have a flat histogram and a mean of
+                    // 0.5. This is the test that the one-line hashes a path
+                    // tracer is often written with fail.
+                    if (d > 0) {
+                        serialSum +=
+                            static_cast<double>(actual[base + d - 1]) * got;
+                    }
                 }
             }
         }
 
-        std::cout << "Compute gradient verified (" << label << "): "
-                  << actual.size() << " B read back at time " << time
-                  << " s, shift " << shift << " texels, " << mismatches
-                  << " mismatched byte(s), " << sentinelTexels << " of "
-                  << (RENDER_WIDTH * RENDER_HEIGHT)
-                  << " texels still hold the sentinel" << std::endl;
+        double mean = sum / static_cast<double>(values);
+        double variance =
+            sumSquares / static_cast<double>(values) - mean * mean;
 
-        // Five probes, chosen so that a transposed mapping cannot pass. The
-        // two off-diagonal corners differ from each other, and 800 != 600, so
-        // swapping x and y changes both the values and which texels are in
-        // range.
-        const uint32_t probes[5][2] = {{0, 0},
+        double expectedPerBucket =
+            static_cast<double>(values) / RNG_BUCKETS;
+        double chiSquare = 0.0;
+        for (size_t b = 0; b < RNG_BUCKETS; b++) {
+            double deviation =
+                static_cast<double>(bucketCounts[b]) - expectedPerBucket;
+            chiSquare += deviation * deviation / expectedPerBucket;
+        }
+
+        // Pearson correlation, using the known marginals rather than the
+        // sample ones: for independent draws from U(0,1), E[xy] is 0.25 and
+        // each variance is 1/12, so r = (E[xy] - 0.25) * 12.
+        size_t serialPairs = pixels * (RNG_DRAWS_PER_PIXEL - 1);
+        double serialR =
+            (serialSum / static_cast<double>(serialPairs) - 0.25) * 12.0;
+
+        // THE INHERITED FLAW, measured rather than remembered. A property of
+        // the shared seeding scheme and not of this port -- see the file
+        // header. Printed every run so that a change to rng.h upstream shows
+        // up here as a changed number instead of going unnoticed.
+        std::vector<uint32_t> seeds;
+        seeds.reserve(pixels);
+        for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
+            for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
+                seeds.push_back(hostPixelSampleSeed(
+                    static_cast<int>(x), static_cast<int>(y), sampleIndex));
+            }
+        }
+        std::sort(seeds.begin(), seeds.end());
+        size_t distinctSeeds = static_cast<size_t>(
+            std::unique(seeds.begin(), seeds.end()) - seeds.begin());
+
+        // THE IMAGE, checked against the PROBE rather than against the host
+        // reference. Deliberate: the generator has already been verified
+        // exactly, so comparing the image to the host again would test it
+        // twice and the image path not at all. Against the probe this answers
+        // the one question left -- did the three channels on screen come from
+        // these same three draws, this frame -- which catches a swapped
+        // channel, a stale image and a dispatch whose two outputs disagree.
+        //
+        // WITHIN 1, not exact, and this is the limit the buffer exists to
+        // escape. The float-to-UNORM conversion is specified to round
+        // correctly but its tie rule is implementation-chosen, so a value
+        // landing exactly between two bytes may legitimately go either way.
+        std::vector<uint8_t> image = readbackImage(
+            storageImage, RENDER_WIDTH, RENDER_HEIGHT,
+            VK_IMAGE_LAYOUT_GENERAL);
+
+        size_t imageOff = 0;
+        size_t alphaOff = 0;
+        for (size_t pixel = 0; pixel < pixels; pixel++) {
+            for (size_t c = 0; c < 3; c++) {
+                float v = actual[pixel * RNG_DRAWS_PER_PIXEL + c];
+                int want = static_cast<int>(std::lround(v * 255.0f));
+                int got = image[pixel * 4 + c];
+                if (got - want > 1 || want - got > 1) {
+                    imageOff++;
+                }
+            }
+
+            // The shader stores a constant 1.0 here, not the fourth draw, so
+            // this is exact and a failure means the alpha channel is not
+            // coming from where it is supposed to.
+            if (image[pixel * 4 + 3] != 255) {
+                alphaOff++;
+            }
+        }
+
+        std::cout << "RNG probe verified (" << label << "): " << values
+                  << " floats read back at time " << time
+                  << " s, sample index " << sampleIndex << std::endl;
+
+        // THE STREAM'S FORMAT, saved and set rather than assumed. Both the
+        // flags and the precision, because reportFrameTiming leaves std::cout
+        // in std::fixed with a precision of 2 and never puts it back, and
+        // std::fixed is a STICKY flag. Without this the startup call prints
+        // 0.659163 and the post-loop call prints 0.85 -- the same value with
+        // most of its digits gone, which for numbers that exist to be
+        // eyeballed is the difference between a diagnostic and a decoration.
+        // The asserted comparisons below are numeric and were never affected;
+        // only what a reader can see was.
+        //
+        // NINE SIGNIFICANT DIGITS, which is what defaultfloat counts, not the
+        // nine decimal places std::fixed would have counted. A float carries
+        // about 7.2 significant digits, so nine shows every digit that is
+        // real and leaves a difference in the last place visible instead of
+        // rounded away.
+        std::ios_base::fmtflags oldFlags = std::cout.flags();
+        std::streamsize oldPrecision = std::cout.precision(9);
+        std::cout << std::defaultfloat;
+
+        std::cout << "\tfidelity:    " << mismatches
+                  << " of " << values
+                  << " differ from the host reference, " << sentinels
+                  << " still hold the sentinel"
+                  << "\n\trange:       [" << minValue << ", " << maxValue
+                  << "], " << outOfRange << " outside [0,1)"
+                  << "\n\tmean:        " << mean << "  (0.5 +/- "
+                  << MEAN_TOLERANCE << ")"
+                  << "\n\tvariance:    " << variance << "  (0.0833333 +/- "
+                  << VARIANCE_TOLERANCE << ")"
+                  << "\n\tchi-square:  " << chiSquare << " over "
+                  << RNG_BUCKETS << " buckets, " << (RNG_BUCKETS - 1)
+                  << " df  (limit " << CHI_SQUARE_LIMIT << ")"
+                  << "\n\tserial corr: " << serialR << "  (0 +/- "
+                  << SERIAL_LIMIT << ")"
+                  << "\n\timage:       " << imageOff << " of " << (pixels * 3)
+                  << " RGB bytes differ from the probe by more than 1, "
+                  << alphaOff << " alpha bytes not 255"
+                  << "\n\tseeds:       " << distinctSeeds << " distinct of "
+                  << pixels << " pixels, " << (pixels - distinctSeeds)
+                  << " collisions -- inherited from rng.h, not a port defect"
+                  << std::endl;
+
+        // Four probe pixels, printed so the numbers are inspectable rather
+        // than only asserted. The two off-diagonal corners differ and
+        // 800 != 600, so a transposed mapping cannot pass unnoticed.
+        const uint32_t probes[4][2] = {{0, 0},
                                        {RENDER_WIDTH - 1, 0},
                                        {0, RENDER_HEIGHT - 1},
-                                       {RENDER_WIDTH - 1, RENDER_HEIGHT - 1},
                                        {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
-        for (const auto& p : probes) {
-            size_t i = (static_cast<size_t>(p[1]) * RENDER_WIDTH + p[0]) * 4;
-            uint32_t sx =
-                (p[0] + static_cast<uint32_t>(shift)) % RENDER_WIDTH;
-            std::cout << "\ttexel (" << p[0] << "," << p[1] << "): "
-                      << static_cast<int>(actual[i + 0]) << ","
-                      << static_cast<int>(actual[i + 1]) << ","
-                      << static_cast<int>(actual[i + 2]) << ","
-                      << static_cast<int>(actual[i + 3]) << "  expected "
-                      << ((sx * 255) / (RENDER_WIDTH - 1)) << ","
-                      << ((p[1] * 255) / (RENDER_HEIGHT - 1)) << ",64,255"
-                      << std::endl;
+        for (const auto& pr : probes) {
+            size_t base = (static_cast<size_t>(pr[1]) * RENDER_WIDTH + pr[0]) *
+                          RNG_DRAWS_PER_PIXEL;
+            std::cout << "\tpixel (" << pr[0] << "," << pr[1] << "): seed "
+                      << hostPixelSampleSeed(static_cast<int>(pr[0]),
+                                             static_cast<int>(pr[1]),
+                                             sampleIndex)
+                      << " -> " << actual[base + 0] << ", "
+                      << actual[base + 1] << ", " << actual[base + 2] << ", "
+                      << actual[base + 3] << std::endl;
         }
+
+        // Restored AFTER the probe pixels, which is where the first version of
+        // this put it wrong: the four values most worth reading printed at
+        // whatever precision the caller happened to leave behind.
+        std::cout.flags(oldFlags);
+        std::cout.precision(oldPrecision);
 
         if (mismatches != 0) {
             throw std::runtime_error(
-                "compute gradient does not match the host formula (first "
-                "mismatch at byte " +
-                std::to_string(firstMismatch) + ")");
+                "RNG probe does not match the host reference: " +
+                std::to_string(mismatches) + " of " + std::to_string(values) +
+                " floats differ (first at index " +
+                std::to_string(firstMismatch) + ", got " +
+                std::to_string(firstActual) + ", expected " +
+                std::to_string(firstExpected) + ")");
+        }
+        if (outOfRange != 0) {
+            throw std::runtime_error(
+                "RNG produced " + std::to_string(outOfRange) +
+                " value(s) outside [0,1) -- see trap 6 at the top of the file");
+        }
+        if (mean < 0.5 - MEAN_TOLERANCE || mean > 0.5 + MEAN_TOLERANCE) {
+            throw std::runtime_error("RNG mean " + std::to_string(mean) +
+                                     " is not 0.5 within tolerance");
+        }
+        double varianceError = variance - 1.0 / 12.0;
+        if (varianceError < -VARIANCE_TOLERANCE ||
+            varianceError > VARIANCE_TOLERANCE) {
+            throw std::runtime_error("RNG variance " +
+                                     std::to_string(variance) +
+                                     " is not 1/12 within tolerance");
+        }
+        if (chiSquare > CHI_SQUARE_LIMIT) {
+            throw std::runtime_error(
+                "RNG histogram is not flat: chi-square " +
+                std::to_string(chiSquare) + " over " +
+                std::to_string(RNG_BUCKETS) + " buckets");
+        }
+        if (serialR < -SERIAL_LIMIT || serialR > SERIAL_LIMIT) {
+            throw std::runtime_error(
+                "consecutive RNG draws are correlated: r = " +
+                std::to_string(serialR));
+        }
+        if (imageOff != 0 || alphaOff != 0) {
+            throw std::runtime_error(
+                "the storage image does not hold the probe's values: " +
+                std::to_string(imageOff) + " RGB byte(s) off by more than 1, " +
+                std::to_string(alphaOff) + " alpha byte(s) not 255");
         }
     }
 
@@ -2588,11 +3029,19 @@ private:
         // per-frame uniform descriptors went with the per-frame buffers, and
         // the per-frame sets went with them, since pointing two identical
         // descriptors at one unchanging image is not a use of anything.
-        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        std::array<VkDescriptorPoolSize, 3> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         poolSizes[1].descriptorCount = 1;
+
+        // Phase 6 step 1. A THIRD TYPE, not a third set: the probe descriptor
+        // goes into the compute set that already exists, so maxSets below is
+        // unchanged at 2. The per-type budgets and the set count are
+        // independent, and this is the clearest case of it so far -- one more
+        // descriptor, no more sets.
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSizes[2].descriptorCount = 1;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2619,8 +3068,9 @@ private:
                   << "\n\tcapacity:  " << poolInfo.maxSets << " sets, "
                   << poolSizes[0].descriptorCount
                   << " COMBINED_IMAGE_SAMPLER + "
-                  << poolSizes[1].descriptorCount
-                  << " STORAGE_IMAGE descriptors"
+                  << poolSizes[1].descriptorCount << " STORAGE_IMAGE + "
+                  << poolSizes[2].descriptorCount
+                  << " STORAGE_BUFFER descriptors"
                   << "\n\tbudgets:   per type, and independent of maxSets"
                   << "\n\tgrowth:    none -- a pool is fixed at creation"
                   << "\n\tfreeing:   sets are released with the pool, not"
@@ -3554,6 +4004,18 @@ private:
         // sampled image, the compute set as a storage image -- and both died
         // with the pool above.
         vkDestroySampler(device, textureSampler, nullptr);
+
+        // The probe buffer, whose descriptor died with the pool just above.
+        // Unmapping before freeing is NOT required -- vkFreeMemory unmaps
+        // implicitly -- and is done anyway, because a live mapping into freed
+        // memory is exactly the class of thing the validation layers are on
+        // for, and a pointer that cannot be dereferenced is better than one
+        // that can be dereferenced into nothing.
+        vkUnmapMemory(device, rngProbeMemory);
+        rngProbeMapped = nullptr;
+        vkDestroyBuffer(device, rngProbeBuffer, nullptr);
+        vkFreeMemory(device, rngProbeMemory, nullptr);
+
         vkDestroyImageView(device, storageImageView, nullptr);
         vkDestroyImage(device, storageImage, nullptr);
         vkFreeMemory(device, storageImageMemory, nullptr);

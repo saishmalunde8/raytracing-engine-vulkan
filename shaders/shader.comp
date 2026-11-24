@@ -1,151 +1,240 @@
 #version 450
 
-// Phase 5, steps 5 and 7 -- the compute shader.
+// Phase 6, step 1 -- a hash RNG in the shader.
 //
-// Step 7 added the push constant and the scroll it drives. Everything else is
-// step 5's and unchanged: at time == 0 this computes exactly what it did then,
-// which is what keeps the startup self-test byte-exact without a special case.
+// The first step of the renderer port, and it deliberately produces no
+// geometry. There is still no camera, no ray and no sphere. What changes is
+// that the shader can now ask for a random number, which is the one thing a
+// path tracer cannot do without and the one thing the CPU's sampling code
+// cannot simply be recompiled into.
 //
-// The first shader in this project that is not part of a drawing pipeline.
-// There is no vertex to transform, no triangle, no fragment, no framebuffer.
-// There is a grid of invocations and an image they write.
+// WHY mt19937 CANNOT COME ALONG. include/raytracer/core/rng.h holds a
+// std::mt19937 and a std::uniform_real_distribution per RNG instance. The
+// Mersenne Twister's state is 624 32-bit words -- about 2.5 KB. The CPU hands
+// out one instance per pixel-sample in deterministic mode, which costs
+// nothing when there are eight threads. Here there are 480,000 invocations,
+// and 480,000 x 2.5 KB is 1.2 GB of state that would have to be initialised
+// before a single sample could be taken. Register and local memory budgets
+// are measured in tens of kilobytes per workgroup. It is not slow; it does
+// not fit.
+//
+// So the generator is replaced by a HASH: a function with no state beyond one
+// 32-bit word, which is advanced and scrambled on each call. The scheme used
+// here is a small linear congruential step followed by a permuting output
+// function -- the PCG construction, which is what GPU renderers have settled
+// on because the arithmetic is five integer operations and the output passes
+// statistical tests that cheaper hashes fail badly.
+//
+// WHAT CARRIES OVER UNCHANGED is the SEEDING. pixelSampleSeed below is a
+// transliteration of pixel_sample_seed in rng.h, operator for operator,
+// because that function already derives its randomness purely from the pixel
+// coordinates and the sample index -- which is exactly the property a shader
+// needs, where there is nowhere to keep a stream between invocations. Only
+// the engine changed; what the engine is started from did not.
+//
+// THE SEEDING SCHEME HAS A KNOWN FLAW AND IT IS PORTED ANYWAY. The three
+// inputs are combined with XOR, and XOR of scaled indices is not injective:
+// i*1973 ^ j*9277 collides. At 800x600, 26,460 of 480,000 pixels share a seed
+// with some other pixel -- 5.5% of them -- so in deterministic mode those
+// pairs draw the identical sample sequence. The host checkpoint measures and
+// prints that number rather than hiding it. It is ported verbatim because
+// this step replaces the ENGINE, not the seeding, and because the scheme is
+// shared with the CPU backend: diverging here would quietly break the
+// property that both backends walk the same sample sequence, which is what
+// the end-of-phase comparison relies on. Fixing it belongs upstream, in one
+// change, to both backends at once.
 
-// THE WORKGROUP SIZE, and it is baked into the SPIR-V rather than passed in.
-// A compute dispatch has two levels: vkCmdDispatch asks for a number of
-// WORKGROUPS, and this line says how many INVOCATIONS are in each one. The
-// total is the product, so 8*8 here and 100*75 groups there is 480,000
-// invocations -- one per texel of an 800x600 image.
-//
-// Why the split exists: invocations within one workgroup run together on one
-// compute unit, can share fast on-chip memory, and can synchronise with
-// barrier(). Across workgroups none of that is true -- they may run in any
-// order, on any unit, or not concurrently at all. 8x8 is the conventional
-// choice for image work: 64 invocations is a multiple of both common hardware
-// scheduling widths (32 on NVIDIA, 64 on AMD), and a square tile keeps the
-// texels each group touches close together in memory, which matters a great
-// deal once the image is tiled rather than linear.
-//
-// Nothing here is shared or synchronised yet. The path tracer is where it
-// starts to matter: rays from neighbouring pixels hit the same BVH nodes, and
-// a workgroup is the unit that could cache them.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// NOT sampler2D. A storage image is bound as image2D, and the differences are
-// not cosmetic:
-//
-//   sampler2D                    image2D
-//   normalised UV coordinates    INTEGER texel coordinates
-//   has a sampler                no sampler exists
-//   filtering, address modes     neither -- no sampler to hold a policy
-//   read with texture()          read/written with imageLoad/imageStore
-//
-// The `rgba8` is a FORMAT QUALIFIER and it is mandatory for a writeonly
-// storage image: the shader has to be told how to pack the vec4 it stores
-// into the image's actual bytes, because unlike a sampled read there is no
-// sampler in the path to do the conversion. It must match the VkImage's
-// format -- R8G8B8A8_UNORM here -- and a mismatch is undefined, not an error.
-//
-// `writeonly` is a promise that lets the compiler skip read paths. Drop it and
-// this still works; claim it and then call imageLoad and the compile fails.
+// Unchanged from Phase 5. Now carries noise rather than a gradient; the
+// format qualifier, the writeonly promise and the reasoning behind both are
+// the same, and the notes on them are in the Phase 5 history.
 layout(binding = 0, rgba8) uniform writeonly image2D outImage;
 
-// PUSH CONSTANTS. A small block of bytes that travels inside the COMMAND
-// BUFFER itself -- not in a buffer, not in a descriptor, not allocated
-// anywhere. vkCmdPushConstants records the value into the command stream, so
-// the number is baked into the recorded commands. There is nothing to
-// allocate, nothing to map, no descriptor to write, and nothing to
-// synchronise: a value recorded into this frame's commands cannot be seen by
-// the frame still executing.
+// A SHADER STORAGE BUFFER, and the first one in this project. The storage
+// image above and this are the two ways a compute shader writes bulk data
+// out, and they are not interchangeable:
 //
-// The budget is tiny by spec -- at least 128 bytes guaranteed, and the
-// device's real figure is printed at startup. That is the whole trade: no
-// setup cost at all, in exchange for a size measured in dozens of bytes. Four
-// bytes of elapsed time is exactly the shape it is for.
+//   image2D (binding 0)             buffer (binding 1)
+//   texel coordinates               a linear index
+//   fixed to a format qualifier     whatever type is declared
+//   8 bits per channel here         full 32-bit floats
+//   clamps on store (UNORM)         stores the bits given
+//   can be sampled by a later pass  cannot be sampled
 //
-// The alternative is the uniform buffer step 6 deleted: one buffer per frame
-// in flight, a descriptor each, a persistent mapping, and a write that has to
-// be ordered against the frame still reading the previous value.
+// The last two rows are why this exists. The checkpoint for this step
+// compares the shader's floats against the identical arithmetic on the host,
+// and a comparison through an 8-bit UNORM image could not do it: the image
+// has 256 distinguishable values per channel, it CLAMPS anything outside
+// [0,1] instead of reporting it, and its float-to-byte rounding has an
+// implementation-chosen tie rule. A buffer of floats has none of those
+// properties -- the bits that arrive are the bits the shader computed.
+//
+// std430, not std140. For a BUFFER block the tighter of the two layouts is
+// available, and the difference is real: in std140 an array of float has a
+// stride of 16 bytes, in std430 it has a stride of 4. vec4 is laid out
+// identically under both, which is the deliberate reason this is a vec4 array
+// and not a struct -- there is no layout question to get wrong. Step 2 brings
+// back a UNIFORM block, where only std140 is available, and that is where the
+// padding rules start to bite.
+layout(binding = 1, std430) writeonly buffer RngProbe {
+    vec4 draws[];
+} probe;
+
 layout(push_constant) uniform PushConstants {
     float time;
 } push;
 
-void main() {
-    // WHERE AM I. gl_GlobalInvocationID is this invocation's position in the
-    // whole dispatch grid: gl_WorkGroupID * gl_WorkGroupSize +
-    // gl_LocalInvocationID, precomputed. It is a uvec3 because a dispatch is
-    // always three-dimensional; z is 1 here and ignored.
-    //
-    // This is the entire input to a compute shader. There is no equivalent of
-    // a vertex's attributes being fed in -- the invocation is handed its own
-    // index and has to derive everything else from it. For a path tracer that
-    // index IS the pixel, and the ray is computed from it.
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+// THE WHOLE GENERATOR STATE: one 32-bit word, against mt19937's 624.
+//
+// A global in GLSL is per-invocation, not shared -- there is no such thing as
+// a variable shared across a dispatch without declaring it so. Every
+// invocation has its own copy, seeded from its own coordinates, which is the
+// shape the CPU achieves with one RNG object per pixel-sample.
+uint rngState;
 
-    // The shader can ask the image how big it is, so the dimensions need no
-    // uniform and cannot drift out of sync with the C++ side.
+// ONE STEP OF THE STREAM.
+//
+// Line 1 is a linear congruential generator: state = state * A + C. On its
+// own an LCG is poor -- the low bits have short periods, and consecutive
+// outputs fall on a small number of hyperplanes. It is kept because it is one
+// multiply and one add and it visits every one of the 2^32 states before
+// repeating.
+//
+// Lines 2 and 3 are the PERMUTING OUTPUT FUNCTION, and they are what make it
+// usable. The state is xor-shifted by an amount DERIVED FROM ITS OWN HIGH
+// BITS -- a data-dependent rotation, which is the trick the construction is
+// named for -- then multiplied by a second odd constant and xor-shifted once
+// more. The effect is that the weak low bits of the LCG never reach the
+// output, and a one-bit change in the state changes about half the output
+// bits.
+//
+// Unsigned overflow WRAPS and that is relied on, not tolerated: both
+// multiplies are modulo 2^32 by design. GLSL defines uint overflow as
+// wrapping, as does C++ for unsigned types, so the host reference computes
+// the identical value.
+//
+// What this replaces is worth keeping in view: this function is five integer
+// operations and four bytes of state, and it is the entire sampling engine.
+uint nextUint() {
+    rngState = rngState * 747796405u + 2891336453u;
+    uint word = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState)
+                * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// A FLOAT IN [0,1), and the shift is the entire point of the line.
+//
+// The obvious conversion is float(nextUint()) * (1.0 / 4294967296.0), and it
+// is WRONG in a way that no picture could ever show. A float has a 24-bit
+// mantissa, so at a magnitude of 2^32 the representable values are 256 apart:
+// every uint from 2^32 - 128 upward converts to exactly 2^32, and multiplying
+// that by 2^-32 gives exactly 1.0. The function would return 1.0 for about
+// one input in 2^25 -- roughly once every 34 million draws, so a render would
+// produce it every few seconds and almost no test would ever see it.
+//
+// That matters because [0,1) is not decoration. A sampler that is handed 1.0
+// hits the degenerate end of its mapping: sqrt(1 - r2) in the cosine-weighted
+// direction becomes exactly zero, giving a direction in the surface plane, and
+// an acos or a 1/(1-r) elsewhere gives infinity or a NaN that propagates
+// silently through a pixel's whole path.
+//
+// Taking the top 24 bits removes the question instead of narrowing it. The
+// numerator is below 2^24, so it is EXACTLY representable; the denominator is
+// a power of two, so the multiply only adjusts the exponent and rounds
+// nothing. The largest result is 16777215/16777216, strictly below 1. There
+// is no rounding anywhere in this line, which is also why the host can
+// predict every value bit for bit.
+//
+// std::uniform_real_distribution<double>(0.0, 1.0) on the CPU specifies the
+// same half-open interval, so this matches the contract it replaces -- though
+// not the values, which no shared contract could give.
+float nextFloat() {
+    return float(nextUint() >> 8) * (1.0 / 16777216.0);
+}
+
+// A TRANSLITERATION of pixel_sample_seed in include/raytracer/core/rng.h.
+// Same constants, same operators, same order, same uint32 wraparound. The
+// known collision flaw described at the top of the file lives here, and is
+// kept deliberately.
+// The third parameter is named sampleIndex, not sample. `sample` is a
+// RESERVED WORD in GLSL 450 -- it is the interpolation qualifier that forces
+// per-sample fragment shading -- so the CPU's parameter name does not survive
+// the port. glslc rejects it outright, which is the good case: a reserved
+// word that happened to parse would be far worse.
+uint pixelSampleSeed(int i, int j, int sampleIndex) {
+    uint seed = 0u;
+    seed ^= uint(i) * 1973u;
+    seed ^= uint(j) * 9277u;
+    seed ^= uint(sampleIndex) * 26699u;
+    seed += 1u;
+    return seed;
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(outImage);
 
-    // THE BOUNDS GUARD. Dead at this resolution and deliberately kept.
+    // Still dead at 800x600, still kept. See the Phase 5 note: the resolution
+    // is the first thing that will change, and stray invocations writing
+    // outside an image are discarded silently rather than diagnosed.
     //
-    // A dispatch can only ask for whole workgroups, so a 801-wide image needs
-    // 101 groups of 8 and gets 808 invocations across -- seven of which have
-    // no texel. 800 and 600 are both multiples of 8, so right now this branch
-    // never fires. It stays because the first thing that will change here is
-    // the resolution, and a missing guard is the classic compute bug: the
-    // stray invocations write outside the image, which for imageStore is
-    // silently discarded rather than diagnosed, so the only symptom is
-    // whatever the extra work cost.
+    // It guards the BUFFER as well now, and there the stakes are different. An
+    // out-of-range imageStore is defined to be dropped; an out-of-range write
+    // through a storage buffer is NOT -- without robustBufferAccess it is
+    // undefined behaviour, and with it the write is dropped but the
+    // out-of-bounds index is still a bug nothing reports. The one guard
+    // covering both is the cheapest version of this that is correct.
     if (coord.x >= size.x || coord.y >= size.y) {
         return;
     }
 
-    // INTEGER MATH DECIDES THE BYTES, on purpose.
+    // THE SAMPLE INDEX, from the push constant, mirroring Phase 5's shift
+    // exactly: both sides truncate the same float product from the same float,
+    // so the host reference derives a bit-identical index and the checkpoint
+    // holds at an arbitrary animated time rather than only at t = 0.
     //
-    // The obvious gradient is float(coord.x) / float(size.x - 1), and it would
-    // look identical. The checkpoint for this step is a byte-for-byte
-    // comparison against the same formula evaluated on the CPU, and a float
-    // divide is specified to within 2.5 ULP in GLSL while the UNORM conversion
-    // rounds with an implementation-chosen tie rule. The margin works out
-    // about eight times larger than the error at this size, so it would
-    // almost certainly pass -- "almost certainly" is not what a checkpoint is
-    // for.
+    // 60 a second, so the noise is replaced about once per displayed frame --
+    // fast enough to look like television static rather than a fixed pattern,
+    // which is the one thing about this step that is visible.
     //
-    // Doing the division in integers removes the question. float(r) / 255.0 is
-    // not exact in binary, but it is within a whisker of r/255, and the UNORM
-    // conversion rounds to nearest, so it lands on exactly r. The C++ side
-    // runs the identical integer expression.
+    // At time == 0 the index is 0, so the startup self-test runs on sample 0
+    // with no special case, exactly as the gradient's shift did.
     //
-    // A path tracer's output is genuinely float and will want an HDR format
-    // and a tone map. This is a verification choice for one step, not a
-    // pattern to keep.
-    // THE SCROLL. 120 texels a second, wrapping at the image width, so the
-    // gradient cycles every 800/120 = 6.67 seconds and the wrap shows up as a
-    // hard vertical edge where 255 meets 0 -- motion that is unmistakable
-    // rather than a slow fade nobody can be sure about.
-    //
-    // int() truncates, and so does the C++ (int) cast that mirrors it. Both
-    // sides compute the same float product from the same float push constant,
-    // so the shift they derive is bit-identical and the checkpoint stays
-    // byte-exact at an ARBITRARY animated time, not only at t = 0.
-    //
-    // At time == 0 the shift is 0 and sx is coord.x, which reduces this to
-    // step 5's formula exactly.
-    int shift = int(push.time * 120.0) % size.x;
+    // This is NOT yet the renderer's sample index. A real sample loop runs
+    // many samples per pixel within one frame and averages them, which is
+    // Phase 7's accumulation. Here one sample is drawn and shown raw.
+    int sampleIndex = int(push.time * 60.0);
 
-    // Only x scrolls. y is deliberately left alone so the two axes stay
-    // distinguishable: a bug that swapped them would turn a horizontal slide
-    // into a vertical one, which is obvious by eye, where a diagonal slide
-    // would hide it.
-    int sx = (coord.x + shift) % size.x;
+    rngState = pixelSampleSeed(coord.x, coord.y, sampleIndex);
 
-    int r = (sx * 255) / (size.x - 1);
-    int g = (coord.y * 255) / (size.y - 1);
+    // FOUR DRAWS, in a fixed order, because the order is part of what is
+    // being verified. The host reference advances the identical state machine
+    // the identical number of times; a shader that drew three or five, or
+    // drew them in a different order, would disagree on every value after the
+    // first.
+    //
+    // Four because that is what the sampling code about to be ported actually
+    // consumes per bounce: two for the pixel jitter in get_ray, two more for
+    // random_cosine_direction. Verifying a stream four deep is verifying the
+    // depth the next steps use.
+    vec4 v = vec4(nextFloat(), nextFloat(), nextFloat(), nextFloat());
 
-    // Blue held at a constant 64 so no texel can come out as step 4's
-    // sentinel (0,0,255,255). Red and green both reach 0 at the top-left
-    // corner, so without this the corner texel would be the sentinel exactly
-    // and "the dispatch never ran" would be indistinguishable from "the
-    // dispatch ran" at the one place it is easiest to look.
-    imageStore(outImage, coord,
-               vec4(float(r) / 255.0, float(g) / 255.0, 64.0 / 255.0, 1.0));
+    // THE PROOF. A linear index into the buffer, row-major, matching the
+    // host's. Written every frame, which costs 7.68 MB of writes per frame
+    // and is accepted deliberately: this buffer exists to be checked, and
+    // making it conditional would mean a second code path that the checkpoint
+    // does not exercise.
+    probe.draws[uint(coord.y) * uint(size.x) + uint(coord.x)] = v;
+
+    // THE PICTURE, from the same four numbers rather than from a second draw,
+    // so what is on screen and what is checked cannot disagree. Three
+    // channels of independent noise read as colour static; a generator with
+    // correlated outputs would show as a grey or tinted cast instead, which
+    // is a hint rather than evidence -- the buffer is the evidence.
+    //
+    // The alpha is 1.0 and not v.w: an image with noisy alpha composites
+    // unpredictably, and the fourth draw is in the buffer where it is checked
+    // properly.
+    imageStore(outImage, coord, vec4(v.x, v.y, v.z, 1.0));
 }
