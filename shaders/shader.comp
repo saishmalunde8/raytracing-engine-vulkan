@@ -1,48 +1,63 @@
 #version 450
 
-// Phase 6, step 1 -- a hash RNG in the shader.
+// Phase 6, step 2 -- the camera uniform and ray generation.
 //
-// The first step of the renderer port, and it deliberately produces no
-// geometry. There is still no camera, no ray and no sphere. What changes is
-// that the shader can now ask for a random number, which is the one thing a
-// path tracer cannot do without and the one thing the CPU's sampling code
-// cannot simply be recompiled into.
+// Step 1 gave the shader random numbers and nothing to spend them on. This
+// step spends them: every invocation now builds a CAMERA RAY for its pixel,
+// jittered within the pixel and originating somewhere on the lens, which is
+// the first object in this project that a path tracer would recognise.
 //
-// WHY mt19937 CANNOT COME ALONG. include/raytracer/core/rng.h holds a
-// std::mt19937 and a std::uniform_real_distribution per RNG instance. The
-// Mersenne Twister's state is 624 32-bit words -- about 2.5 KB. The CPU hands
-// out one instance per pixel-sample in deterministic mode, which costs
-// nothing when there are eight threads. Here there are 480,000 invocations,
-// and 480,000 x 2.5 KB is 1.2 GB of state that would have to be initialised
-// before a single sample could be taken. Register and local memory budgets
-// are measured in tens of kilobytes per workgroup. It is not slow; it does
-// not fit.
+// There is still no sphere and no material. Nothing is intersected. The
+// window shows each ray's direction as a colour, which is a gradient rather
+// than a scene.
 //
-// So the generator is replaced by a HASH: a function with no state beyond one
-// 32-bit word, which is advanced and scrambled on each call. The scheme used
-// here is a small linear congruential step followed by a permuting output
-// function -- the PCG construction, which is what GPU renderers have settled
-// on because the arithmetic is five integer operations and the output passes
-// statistical tests that cheaper hashes fail badly.
+// WHAT IS PORTED is camera::initialize() and camera::get_ray() from
+// include/raytracer/camera/camera.h, split across the two sides of the
+// host/device boundary along a line worth noticing. initialize() runs ONCE
+// per render and computes six vectors from vfov, lookfrom, lookat, vup,
+// defocus_angle and focus_dist. get_ray() runs once per sample and uses only
+// those six vectors. So initialize() stays on the host, its six results are
+// uploaded, and only get_ray() becomes shader code. Nothing about the fov or
+// the basis vectors is recomputed 480,000 times a frame.
 //
-// WHAT CARRIES OVER UNCHANGED is the SEEDING. pixelSampleSeed below is a
-// transliteration of pixel_sample_seed in rng.h, operator for operator,
-// because that function already derives its randomness purely from the pixel
-// coordinates and the sample index -- which is exactly the property a shader
-// needs, where there is nowhere to keep a stream between invocations. Only
-// the engine changed; what the engine is started from did not.
+// THE DIRECTION IS NOT NORMALISED, and that is a faithful port rather than an
+// oversight. The CPU returns pixel_sample - ray_origin as it stands, and
+// sphere::hit consumes it with the full quadratic, where the a coefficient is
+// dot(d, d) rather than 1. Normalising here would still intersect correctly
+// but would change every t value by the direction's length, so the shadow
+// epsilon and the ray extents would silently mean different distances on the
+// two backends. The one place a unit vector is wanted is the display below,
+// where it is normalised locally and thrown away.
 //
-// THE SEEDING SCHEME HAS A KNOWN FLAW AND IT IS PORTED ANYWAY. The three
-// inputs are combined with XOR, and XOR of scaled indices is not injective:
-// i*1973 ^ j*9277 collides. At 800x600, 26,460 of 480,000 pixels share a seed
-// with some other pixel -- 5.5% of them -- so in deterministic mode those
-// pairs draw the identical sample sequence. The host checkpoint measures and
-// prints that number rather than hiding it. It is ported verbatim because
-// this step replaces the ENGINE, not the seeding, and because the scheme is
-// shared with the CPU backend: diverging here would quietly break the
-// property that both backends walk the same sample sequence, which is what
-// the end-of-phase comparison relies on. Fixing it belongs upstream, in one
-// change, to both backends at once.
+// THE DRAW ORDER IS PART OF THE INTERFACE. get_ray consumes its random
+// numbers in a fixed order -- two for the pixel offset, two for the defocus
+// disk, then one for the shutter time -- and the CPU's comment says why: that
+// order defines the stream a deterministic render reproduces. Three details
+// in it are easy to get wrong and silent if you do:
+//
+//   The DEFOCUS PAIR IS CONDITIONAL. When defocus_angle is zero the CPU takes
+//   the ray origin straight from the camera centre and draws nothing, so the
+//   shutter draw is the THIRD number rather than the fifth. A port that
+//   always drew two would be correct at this camera and desynchronised at
+//   any camera without a lens.
+//
+//   THE SHUTTER DRAW HAPPENS EVEN THOUGH NOTHING READS IT. There is no motion
+//   blur on the GPU yet, so the value is stored on the ray and ignored. It is
+//   drawn anyway, because the stream POSITION is shared semantics: skipping
+//   it would shift every later draw by one and leave the two backends
+//   sampling different things while both looked plausible.
+//
+//   THE DISK IS SAMPLED IN POLAR FORM, not by rejection. sqrt of one draw for
+//   the radius, 2*pi times another for the angle -- exactly two draws, where
+//   a rejection loop would consume a variable number and desynchronise the
+//   stream per pixel. The CPU chose polar for that reason and the note is in
+//   defocus_disk_sample; the constraint is much sharper here, since a
+//   rejection loop would also make neighbouring invocations diverge.
+//
+// std140, AND IT IS THE TIGHT SPOT OF THIS STEP. See the host side: the
+// uniform block below is laid out by rules that are not the ones a C++ struct
+// follows, and the mismatch is silent. The comment on the block says what the
+// trap is; the host has static_asserts that make it a compile error instead.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -74,12 +89,58 @@ layout(binding = 0, rgba8) uniform writeonly image2D outImage;
 // available, and the difference is real: in std140 an array of float has a
 // stride of 16 bytes, in std430 it has a stride of 4. vec4 is laid out
 // identically under both, which is the deliberate reason this is a vec4 array
-// and not a struct -- there is no layout question to get wrong. Step 2 brings
-// back a UNIFORM block, where only std140 is available, and that is where the
-// padding rules start to bite.
-layout(binding = 1, std430) writeonly buffer RngProbe {
-    vec4 draws[];
+// and not a struct -- there is no layout question to get wrong. The uniform
+// block above is where only std140 is available and the padding rules bite.
+//
+// TWO ENTRIES PER PIXEL as of step 2, where step 1 had one. The probe now
+// carries the finished ray rather than the raw draws:
+//
+//   entry 2n     xyz = ray origin,    w = shutter time
+//   entry 2n + 1 xyz = ray direction, w unused
+//
+// The raw draws left the probe because the ray is strictly stronger evidence:
+// it is computed FROM them, so a wrong draw cannot produce a right ray. The
+// host reference reproduces all five draws to build its own ray, and runs
+// step 1's distribution tests on those -- which the GPU inherits, since the
+// rays agreeing is what establishes that both sides drew the same numbers.
+layout(binding = 1, std430) writeonly buffer RayProbe {
+    vec4 entries[];
 } probe;
+
+// THE CAMERA, and the first UNIFORM block since step 6 deleted the last one.
+// Read-only to the shader, the same value for every invocation in the
+// dispatch, and written once by the host because in this phase the camera
+// never moves. Phase 7's camera controls are what will make it per-frame.
+//
+// std140 IS NOT THE C++ LAYOUT, and nothing diagnoses the difference. The two
+// rules that bite here:
+//
+//   A vec3 has a base alignment of 16 BYTES AND A SIZE OF 12. It is padded to
+//   a 16-byte boundary before the next member starts -- but the padding is
+//   not part of it.
+//
+//   A float has a base alignment of 4, so a float placed after a vec3 LANDS
+//   IN THAT PADDING. defocusAngle below is at byte offset 92, not 96: it sits
+//   in the four bytes left over by defocusDiskV.
+//
+// That second one is the trap, because the instinct is to give every member
+// the same alignas(16) on the host for consistency -- which would move the
+// float to 96, and the shader would then read four bytes of padding as the
+// defocus angle. Whatever happened to be there would decide whether the lens
+// existed. The host's static_asserts assert offset 92 precisely so that the
+// consistent-looking version fails to compile.
+//
+// std430, which the probe buffer below uses, would pack this differently
+// again. The tighter layout is not available to a uniform block.
+layout(binding = 2, std140) uniform CameraUniform {
+    vec3 center;         // offset  0
+    vec3 pixel00Loc;     // offset 16
+    vec3 pixelDeltaU;    // offset 32
+    vec3 pixelDeltaV;    // offset 48
+    vec3 defocusDiskU;   // offset 64
+    vec3 defocusDiskV;   // offset 80
+    float defocusAngle;  // offset 92 -- in defocusDiskV's padding
+} camera;
 
 layout(push_constant) uniform PushConstants {
     float time;
@@ -171,6 +232,101 @@ uint pixelSampleSeed(int i, int j, int sampleIndex) {
     return seed;
 }
 
+// From include/raytracer/core/rtweekend.h, narrowed to float. The CPU's
+// constant has 20 digits because it is a double; a float holds about 7, so
+// the rest are decoration kept only so the two lines read as the same number.
+const float PI = 3.1415926535897932385;
+
+// The CPU's ray class, minus everything a class gave it. No constructors, no
+// accessors, no at(t) -- a plain aggregate, because that is all a shader can
+// have and all this needs.
+//
+// `time` is DEAD WEIGHT in this step and deliberately carried: see the file
+// header on the shutter draw. Motion blur is what reads it, and the field
+// being here is what will make adding that a change to sphere::hit rather
+// than a change to the sampling order.
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+    float time;
+};
+
+// camera::get_ray from camera.h, transliterated. The draw order is the
+// interface -- see the file header.
+Ray getRay(int i, int j) {
+    // DRAWS 1 AND 2: the jitter, from camera::sample_square, which returns a
+    // point in [-0.5, +0.5]^2. This is what turns one ray per pixel into
+    // antialiasing: without it every sample down a pixel would take the
+    // identical path and averaging them would average nothing.
+    //
+    // The CPU's version returns a vec3 with z = 0 and this returns a vec2.
+    // That is not a deviation in the arithmetic -- the z component was never
+    // used, since it is added to nothing.
+    //
+    // THE TWO DRAWS ARE SEQUENCED INTO NAMED LOCALS, and writing
+    // vec2(nextFloat() - 0.5, nextFloat() - 0.5) instead would be a genuine
+    // bug rather than a style choice. GLSL does not define the order in which
+    // an operator's or a constructor's operands are evaluated, so which of
+    // the two draws lands in .x is up to the compiler. Both values are random
+    // and both end up used, so a compiler that evaluated them right to left
+    // would TRANSPOSE THE JITTER -- correct-looking antialiasing, silently
+    // sampling a different stream from the CPU, and nothing to see.
+    //
+    // Step 1's four-draw probe had exactly this shape and its bit-exact
+    // comparison passed, which means this toolchain happens to evaluate left
+    // to right. That is the definition of correct by accident: it is not a
+    // guarantee, it is this compiler's current behaviour.
+    //
+    // The CPU's sample_square has the same construction and the same hazard:
+    // C++ leaves the evaluation order of function arguments unspecified too.
+    // That one is in include/, which is synced from the CPU repository, so it
+    // is flagged rather than fixed here.
+    float jitterX = nextFloat();
+    float jitterY = nextFloat();
+    vec2 offset = vec2(jitterX - 0.5, jitterY - 0.5);
+
+    // The pixel's position on the viewport plane, which sits at focus_dist
+    // along -w. float(i) and float(j) rather than an implicit conversion,
+    // because GLSL has no implicit int-to-float in this position.
+    vec3 pixelSample = camera.pixel00Loc
+                     + (float(i) + offset.x) * camera.pixelDeltaU
+                     + (float(j) + offset.y) * camera.pixelDeltaV;
+
+    vec3 rayOrigin = camera.center;
+
+    // DRAWS 3 AND 4, CONDITIONALLY. A thin lens: rather than every ray
+    // leaving one point, each leaves a random point on a disk of radius
+    // focus_dist * tan(defocus_angle / 2). Everything on the viewport plane
+    // stays sharp because every ray through a given point on that plane
+    // converges there whatever part of the lens it came from; everything
+    // nearer or further spreads out. That is the whole of depth of field.
+    //
+    // The branch is the CPU's, condition for condition. It is also the one
+    // place in this function where invocations in a workgroup can diverge --
+    // they will not here, since defocusAngle is a uniform and every
+    // invocation takes the same side, which is why a uniform branch costs
+    // nothing where a per-pixel one would serialise both paths.
+    if (camera.defocusAngle > 0.0) {
+        // Sequenced for the same reason as the jitter above, though these two
+        // were already in separate statements and so already ordered.
+        float diskR = nextFloat();
+        float diskTheta = nextFloat();
+        float r = sqrt(diskR);
+        float theta = 2.0 * PI * diskTheta;
+        rayOrigin = camera.center
+                  + (r * cos(theta)) * camera.defocusDiskU
+                  + (r * sin(theta)) * camera.defocusDiskV;
+    }
+
+    // DRAW 5, UNCONDITIONALLY, and nothing reads the result. See the file
+    // header: the stream position is shared with the CPU backend, so the draw
+    // is taken whether or not there is yet anything to spend it on.
+    float rayTime = nextFloat();
+
+    // Unnormalised, exactly as the CPU leaves it. See the file header.
+    return Ray(rayOrigin, pixelSample - rayOrigin, rayTime);
+}
+
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(outImage);
@@ -208,33 +364,32 @@ void main() {
 
     rngState = pixelSampleSeed(coord.x, coord.y, sampleIndex);
 
-    // FOUR DRAWS, in a fixed order, because the order is part of what is
-    // being verified. The host reference advances the identical state machine
-    // the identical number of times; a shader that drew three or five, or
-    // drew them in a different order, would disagree on every value after the
-    // first.
-    //
-    // Four because that is what the sampling code about to be ported actually
-    // consumes per bounce: two for the pixel jitter in get_ray, two more for
-    // random_cosine_direction. Verifying a stream four deep is verifying the
-    // depth the next steps use.
-    vec4 v = vec4(nextFloat(), nextFloat(), nextFloat(), nextFloat());
+    Ray r = getRay(coord.x, coord.y);
 
-    // THE PROOF. A linear index into the buffer, row-major, matching the
-    // host's. Written every frame, which costs 7.68 MB of writes per frame
-    // and is accepted deliberately: this buffer exists to be checked, and
-    // making it conditional would mean a second code path that the checkpoint
-    // does not exercise.
-    probe.draws[uint(coord.y) * uint(size.x) + uint(coord.x)] = v;
+    // THE PROOF, two entries per pixel. Row-major, matching the host's index
+    // arithmetic. The shutter time rides in the origin's unused w component
+    // rather than in a third entry: it is one float, and giving it 16 bytes
+    // of its own to stay tidy would cost 7.68 MB a frame.
+    uint entry = 2u * (uint(coord.y) * uint(size.x) + uint(coord.x));
+    probe.entries[entry + 0u] = vec4(r.origin, r.time);
+    probe.entries[entry + 1u] = vec4(r.direction, 0.0);
 
-    // THE PICTURE, from the same four numbers rather than from a second draw,
-    // so what is on screen and what is checked cannot disagree. Three
-    // channels of independent noise read as colour static; a generator with
-    // correlated outputs would show as a grey or tinted cast instead, which
-    // is a hint rather than evidence -- the buffer is the evidence.
+    // THE PICTURE: the direction as a colour, which is the conventional way
+    // to look at a ray field. normalize first -- the direction is
+    // deliberately unnormalised, so without this the image would show the
+    // direction's LENGTH as brightness and the perspective divide would read
+    // as a vignette. Then map [-1,1] to [0,1], since half of every component
+    // is negative and an image cannot show that.
     //
-    // The alpha is 1.0 and not v.w: an image with noisy alpha composites
-    // unpredictably, and the fourth draw is in the buffer where it is checked
-    // properly.
-    imageStore(outImage, coord, vec4(v.x, v.y, v.z, 1.0));
+    // What this should look like: a smooth two-axis gradient, because
+    // neighbouring pixels have neighbouring directions. No noise, even though
+    // the jitter is still there -- the jitter moves a direction by a fraction
+    // of a pixel's worth of angle, far below one step of an 8-bit channel.
+    // Visible noise here would mean the jitter is being applied in units of
+    // something other than a pixel.
+    //
+    // The axis a component maps to is arbitrary and the mapping is not a
+    // checkpoint: the probe buffer is. See verifyCameraRays on the host.
+    vec3 unitDirection = normalize(r.direction);
+    imageStore(outImage, coord, vec4(unitDirection * 0.5 + 0.5, 1.0));
 }

@@ -1,140 +1,123 @@
 // Vulkan backend entry point.
 //
-// Phase 6, step 1 -- a hash RNG in the shader.
+// Phase 6, step 2 -- the camera uniform and ray generation.
 //
-// The first step of the renderer port. Phase 5 ended with the machinery
-// finished and nothing worth computing in it: a compute shader wrote a
-// gradient into a storage image every frame, two barriers ordered that
-// against the display, and a three-vertex draw put it on screen. This step
-// replaces the gradient with the one primitive every other part of a path
-// tracer is built out of -- a random number.
+// Step 1 gave the shader random numbers and nothing to spend them on. This
+// step spends them: every invocation builds a CAMERA RAY for its pixel,
+// jittered within the pixel and leaving from a random point on the lens. It
+// is the first object here a path tracer would recognise.
 //
-// There is still no camera, no ray, no sphere and no material. The window
-// shows coloured static, and that is the whole visible result.
+// Nothing is intersected yet. There is no sphere and no material, and the
+// window shows each ray's direction as a colour -- a smooth two-axis
+// gradient, which is a ray field and not a scene.
 //
-// WHY THE CPU'S GENERATOR CANNOT SIMPLY BE RECOMPILED. include/raytracer/
-// core/rng.h holds a std::mt19937 and a std::uniform_real_distribution per
-// RNG instance, and the Mersenne Twister's state is 624 32-bit words -- about
-// 2.5 KB. In deterministic mode the CPU constructs one instance per
-// pixel-sample, which is free when there are eight threads. Here there are
-// 480,000 invocations in flight, and 480,000 x 2.5 KB is 1.2 GB of state that
-// would have to be initialised before one sample could be drawn, against
-// register and local-memory budgets measured in tens of kilobytes per
-// workgroup. The problem is not that it would be slow. It does not fit.
+// WHERE THE HOST/DEVICE LINE FALLS, which is most of what porting a renderer
+// to a GPU consists of. camera::initialize() in camera.h turns six scene
+// parameters -- vfov, lookfrom, lookat, vup, defocus_angle, focus_dist --
+// into six vectors. camera::get_ray() uses only those six vectors. So
+// initialize() stays on the host and runs once, its results are uploaded, and
+// get_ray() becomes the shader. Nothing about the field of view or the basis
+// is recomputed 480,000 times a frame, and the uniform block is small enough
+// to be a uniform block because of where that line was drawn.
 //
-// WHAT REPLACES IT is a HASH: four bytes of state, advanced and scrambled on
-// each call. One linear congruential step, then a permuting output function
-// that xor-shifts the state by an amount derived from its own high bits
-// before a second multiply -- the PCG construction. Five integer operations.
-// The LCG alone would be unusable (its low bits have short periods and its
-// outputs fall on few hyperplanes); the output function is what makes it
-// pass the tests that cheaper hashes fail. The details are in shader.comp,
-// next to the code.
+// THE ARITHMETIC IS IN DOUBLE UNTIL THE UPLOAD. The CPU computes the basis in
+// double, so this does too, and the single narrowing to float happens as the
+// values enter the block the shader reads. Computing in float instead would
+// round every intermediate, and the two backends would then differ by more
+// than one rounding with nothing to say which was closer to right.
 //
-// WHAT DOES NOT CHANGE IS THE SEEDING. pixelSampleSeed in the shader is a
-// transliteration of pixel_sample_seed in rng.h -- same constants, same
-// operators, same order -- because that function already derives randomness
-// purely from the pixel coordinates and the sample index, which is exactly
-// what a shader needs, having nowhere to keep a stream between invocations.
-// The engine changed; what it is started from did not.
+// THE DIRECTION IS NOT NORMALISED, and that is faithfulness rather than an
+// oversight. The CPU returns pixel_sample - ray_origin as it stands, and
+// sphere::hit consumes it with the full quadratic, where a is dot(d, d)
+// rather than 1. Normalising would still intersect correctly but would
+// rescale every t, so the shadow epsilon and the ray extents would mean
+// different distances on the two backends. The display normalises a local
+// copy and throws it away.
 //
-// THE SEEDING SCHEME HAS A DEFECT AND IS PORTED ANYWAY. Its three inputs are
-// combined with XOR, and XOR of scaled indices is not injective:
-// i*1973 ^ j*9277 collides. At 800x600 exactly 26,460 of 480,000 pixels share
-// a seed with another pixel -- 5.5% -- so in deterministic mode those pairs
-// draw the IDENTICAL sample sequence. Across ten samples, 1,513,656 of
-// 4,800,000 (pixel, sample) pairs collide. This is not a porting artefact:
-// deterministic = true is set in src/main.cpp and tools/gallery.cpp, so it is
-// in the CPU renders being produced today. It is scattered rather than
-// clustered, so it reads as slightly less effective sampling rather than as a
-// visible pattern, which is why it has gone unnoticed.
+// THE CHECKPOINT CHANGES CHARACTER HERE, and that is the step's real lesson.
+// Step 1's generator was integer arithmetic and a power-of-two scale, so the
+// host could predict every bit and the checkpoint was exact. A camera ray
+// involves divisions, a square root and a sine, and Vulkan permits a couple
+// of units in the last place on those -- so exactness is gone and will not
+// come back for the rest of the port.
 //
-// It is transliterated flaw and all, for two reasons. This step replaces the
-// engine, not the seeding, and changing both at once would leave neither
-// verifiable. And the scheme is SHARED with the CPU backend -- diverging here
-// would quietly break the property that both backends walk the same sample
-// sequence, which is the whole basis of the end-of-phase comparison. The fix
-// belongs upstream in rng.h, applied to both backends in one change. Until
-// then verifyRngProbe measures the collision count and prints it, so the
-// number is in the log rather than in somebody's memory.
+// A tolerance alone would be a weak replacement, because a tolerance only
+// says the two sides are close and says nothing about whether either is
+// right. So the tolerance is backed by INVARIANTS -- statements that hold
+// exactly in geometry, that a merely-close ray field fails:
 //
-// THE CHECKPOINT IS BIT-EXACT, not statistical, and that was not the plan.
-// A hash RNG looks like a thing you can only test statistically -- draw a lot
-// of numbers, check the mean is near 0.5. That test is weak: it passes for
-// generators with badly correlated outputs, which is the actual failure mode
-// of the one-liners this replaces. It turns out not to be necessary, because
-// EVERY OPERATION IN THE GENERATOR IS EXACT. The hash is integer arithmetic
-// with defined wraparound. The float conversion takes a value below 2^24
-// (exactly representable) and multiplies by 2^-24 (a power of two, so only
-// the exponent moves). Nothing rounds anywhere. So the host can predict all
-// 1,920,000 floats bit for bit, and the checkpoint is the same kind of
-// comparison the gradient had: zero mismatched bytes, or a failure.
+//   PLANARITY. Every ray direction must have a dot product with w of exactly
+//   -focus_dist, because the viewport is a plane perpendicular to w at that
+//   distance and the lens offset lies in the u-v plane. One number per pixel,
+//   and it pins the basis orthogonality, the focus distance and the defocus
+//   disk's orientation simultaneously. A camera that was skewed, mis-scaled
+//   or had its disk built from the wrong vectors fails it.
 //
-// That answers FIDELITY -- did the shader compute what was intended. It says
-// nothing about QUALITY -- is what was intended any good. Those are different
-// questions and the statistics are kept for the second one: range, mean,
-// variance, a chi-square over sixteen buckets, and the correlation between
-// consecutive draws in a stream, which is the one that would catch a
-// plausible-looking hash whose outputs march.
+//   SYMMETRY. Pixel-centre directions for mirrored pairs must sum to exactly
+//   -2 * focus_dist * w. This catches a flipped viewport axis, which
+//   planarity cannot: an upside-down camera is still perfectly planar.
 //
-// THE PROBE BUFFER is the first shader storage buffer in this project, and it
-// exists because the comparison above cannot be done through the image. An
-// R8G8B8A8_UNORM storage image has 256 distinguishable values per channel, it
-// CLAMPS anything outside [0,1] rather than reporting it, and its
-// float-to-byte rounding has an implementation-chosen tie rule -- so it can
-// neither carry a float faithfully nor reveal one that left the interval. A
-// buffer of vec4 delivers the bits the shader stored. It is host-visible and
-// mapped once for its whole life, which is the right trade for a diagnostic:
-// no staging copy, no transfer, read directly once the device is idle. Real
-// render data would be device-local with a staged upload.
+// Neither is visible. A direction-as-colour gradient looks correct for a
+// camera that is skewed, inverted, or pointing somewhere else entirely.
 //
-// Six traps:
+// Eight traps:
 //
 //   1. CONSTANTS THAT MUST AGREE ACROSS THE HOST/SHADER BOUNDARY, WITH
 //      NOTHING CHECKING THAT THEY DO. WORKGROUP_SIZE against local_size_x/y
-//      was the first. This step adds the worst case yet: the three hash
-//      constants, the shift amounts and the number of draws per pixel are
-//      written twice, once in GLSL and once in C++, compiled by different
-//      compilers, and the two copies are the checkpoint comparing itself
-//      against itself. A matched pair of edits is invisible; a mismatched one
-//      shows up as a total mismatch rather than a subtle one, which is the
-//      only mercy available. The duplication is unavoidable -- there is no
-//      language in which both sides could be written once -- and naming it is
-//      the mitigation.
+//      was the first; the hash constants added a pair of algorithms written
+//      twice; this step adds getRay, written twice, and the std140 offsets.
+//      The offsets are the one case with a real mitigation -- the
+//      static_asserts on CameraUniform turn a silent mismatch into a compile
+//      error -- and that is the pattern to reach for whenever the boundary
+//      can be stated as a number.
 //   2. FORMAT FEATURES ARE NOT GUARANTEED. What a VkFormat may be used for
-//      varies by device and by tiling, and must be queried. A guaranteed
-//      format is queried anyway, because the query is the habit worth having.
-//      R32G32B32A32_SFLOAT is probed here too, ahead of needing it: Phase 7
-//      accumulates into a float image, and STORAGE_IMAGE_ATOMIC turned out
-//      unsupported for R8G8B8A8_UNORM on this device.
+//      varies by device and by tiling, and must be queried.
+//      R32G32B32A32_SFLOAT is probed ahead of Phase 7 needing it, and it
+//      reports no STORAGE_IMAGE_ATOMIC -- as R8G8B8A8_UNORM does -- so
+//      accumulation cannot use atomics on this device in any format.
 //   3. VkClearColorValue IS float32 REGARDLESS OF THE IMAGE'S BIT DEPTH.
 //      The union has an integer member and it is the wrong one for a UNORM
 //      image: 0-255 bytes go in as 0.0-1.0 floats.
 //   4. RENDER RESOLUTION IS NOT WINDOW SIZE. The storage image is fixed at
-//      800x600 and stretched across whatever the window is, so resizing
-//      reallocates nothing. A path tracer wants exactly this.
+//      800x600 and stretched across whatever the window is. It is also what
+//      the camera's aspect ratio is derived from, which is the right source:
+//      the viewport has to match the pixel grid being sampled, not the window
+//      the result is displayed in.
 //   5. A MISSING BARRIER IS STILL NOT VISUALLY VERIFIABLE. On unified-memory
-//      hardware with a single queue, removing either of the two barriers
-//      around the dispatch would very probably still look correct, because
-//      the hazard it guards is one this device happens not to expose. That is
-//      what makes it the defect that ships: correct by accident on the machine
-//      it was written on. Neither the screen nor any readback can prove the
-//      barriers are right -- the reasoning in recordStorageImageBarrier is the
-//      proof, and the access masks are the part a reviewer checks.
+//      hardware with a single queue, removing either barrier around the
+//      dispatch would very probably still look correct, because the hazard it
+//      guards is one this device happens not to expose. Correct by accident
+//      on the machine it was written on. No readback can prove it -- the
+//      reasoning in recordStorageImageBarrier is the proof, and the access
+//      masks are what a reviewer checks.
 //   6. THE NAIVE uint-TO-FLOAT CONVERSION RETURNS 1.0, and [0,1) is a
 //      contract the samplers depend on. float(u) * (1.0/4294967296.0) gives
-//      exactly 1.0 for every u from 2^32 - 128 upward, because a float's
-//      representable values are 256 apart at that magnitude. About one draw
-//      in 2^25 -- often enough to appear every few seconds in a render, rare
-//      enough that no casual test sees it. Downstream, 1.0 reaches
-//      sqrt(1 - r2) in the cosine-weighted direction as exactly zero, and an
-//      acos or a 1/(1-r) elsewhere as infinity or a NaN that spreads through
-//      a pixel's whole path. Using the top 24 bits removes the case instead
-//      of narrowing it.
+//      exactly 1.0 for every u from 2^32 - 128 upward, about one draw in
+//      2^25. Downstream, 1.0 reaches sqrt(1 - r2) as exactly zero and a
+//      1/(1-r) elsewhere as infinity. The top 24 bits remove the case
+//      instead of narrowing it.
+//   7. HOW MANY DRAWS A RAY CONSUMES IS NOT CONSTANT. get_ray takes two for
+//      the jitter, two for the defocus disk ONLY IF defocus_angle > 0, and
+//      one for the shutter time always -- five at this camera, three at a
+//      camera with no lens. Two ways to get this wrong, both silent: drawing
+//      the defocus pair unconditionally desynchronises every camera without a
+//      lens, and skipping the shutter draw because nothing reads it yet
+//      shifts every later draw by one. The stream POSITION is shared
+//      semantics with the CPU backend, so a draw is taken whether or not
+//      there is anything to spend it on.
+//   8. NEITHER GLSL NOR C++ DEFINES THE EVALUATION ORDER OF AN EXPRESSION'S
+//      OPERANDS, so vec2(nextFloat() - 0.5, nextFloat() - 0.5) does not say
+//      which draw becomes x. Both values are random and both get used, so a
+//      compiler evaluating right to left transposes the jitter and nothing
+//      looks wrong -- the antialiasing is still correct, off a different
+//      stream. Step 1's four-draw probe had this shape and its bit-exact
+//      comparison passed, which means only that this toolchain happens to go
+//      left to right. Every draw is now sequenced into a named local on both
+//      sides. The CPU's sample_square still has the original form; it is in
+//      include/, which is synced, so it is flagged rather than fixed.
 //
-// Next: a camera uniform and ray generation, which brings back a uniform
-// buffer and with it std140's padding rules -- the layout std430 above does
-// not have.
+// Next: sphere intersection and the sky on a miss, which turns this ray field
+// into the first image with an object in it.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -277,6 +260,63 @@ struct SwapChainSupportDetails {
 // unordered pool with the post-transform cache behind it, and std140 alignment
 // waiting for Phase 6's camera to put a vec3 next to a mat4.
 
+// Phase 6 step 2. THE HOST SIDE OF THE SHADER'S UNIFORM BLOCK, and the
+// alignment here is the whole point.
+//
+// std140 gives a vec3 a base alignment of 16 bytes and a size of 12. C++
+// gives glm::vec3 an alignment of 4 and a size of 12. So without alignas the
+// members would pack at 0, 12, 24, 36, 48, 60, 72 while the shader reads them
+// at 0, 16, 32, 48, 64, 80, 92 -- every vector after the first one wrong, and
+// nothing anywhere would say so. The camera would simply point somewhere
+// else, which looks exactly like a camera that was configured wrong.
+//
+// THE FLOAT HAS NO alignas, AND THAT IS NOT AN OVERSIGHT. Giving it one for
+// consistency is the mistake this struct exists to demonstrate. A float's
+// base alignment in std140 is 4, so it is placed at the next multiple of 4
+// after defocusDiskV's twelve bytes end -- offset 92, inside the padding that
+// brought defocusDiskV up to 16. Adding alignas(16) would move it to 96 and
+// the shader would read defocusDiskV's padding as the defocus angle: four
+// bytes of whatever, deciding whether the lens exists.
+//
+// The static_asserts below are the real mitigation. Every offset the shader
+// uses is stated here as a compile-time claim, so the consistent-looking
+// version of this struct does not compile rather than rendering a subtly
+// wrong image. They were checked against the SPIR-V the shader compiles to,
+// not against a reading of the specification.
+struct CameraUniform {
+    alignas(16) glm::vec3 center;
+    alignas(16) glm::vec3 pixel00Loc;
+    alignas(16) glm::vec3 pixelDeltaU;
+    alignas(16) glm::vec3 pixelDeltaV;
+    alignas(16) glm::vec3 defocusDiskU;
+    alignas(16) glm::vec3 defocusDiskV;
+    float defocusAngle;
+};
+
+static_assert(offsetof(CameraUniform, center) == 0,
+              "CameraUniform::center must sit at std140 offset 0");
+static_assert(offsetof(CameraUniform, pixel00Loc) == 16,
+              "CameraUniform::pixel00Loc must sit at std140 offset 16");
+static_assert(offsetof(CameraUniform, pixelDeltaU) == 32,
+              "CameraUniform::pixelDeltaU must sit at std140 offset 32");
+static_assert(offsetof(CameraUniform, pixelDeltaV) == 48,
+              "CameraUniform::pixelDeltaV must sit at std140 offset 48");
+static_assert(offsetof(CameraUniform, defocusDiskU) == 64,
+              "CameraUniform::defocusDiskU must sit at std140 offset 64");
+static_assert(offsetof(CameraUniform, defocusDiskV) == 80,
+              "CameraUniform::defocusDiskV must sit at std140 offset 80");
+
+// The one that catches the plausible mistake. 92, not 96: the float belongs
+// in the preceding vec3's padding.
+static_assert(offsetof(CameraUniform, defocusAngle) == 92,
+              "CameraUniform::defocusAngle must sit at std140 offset 92 -- in "
+              "defocusDiskV's padding. An alignas(16) here would move it to "
+              "96 and the shader would read padding as the defocus angle.");
+
+static_assert(sizeof(CameraUniform) == 96,
+              "CameraUniform must be 96 bytes: 92 used, rounded up to the "
+              "16-byte alignment std140 gives the block");
+
 class vulkan_app {
 public:
     void run() {
@@ -293,7 +333,7 @@ public:
         // The probe needs no invalidate before it is read: its memory is
         // HOST_COHERENT, so the GPU's writes are visible to the host as soon
         // as the submission that made them completes.
-        verifyRngProbe(lastPushedTime, "after the main loop");
+        verifyCameraRays(lastPushedTime, "after the main loop");
 
         cleanup();
     }
@@ -429,31 +469,80 @@ private:
     // compilers, and a disagreement is silent -- see trap 1 at the top.
     static const uint32_t WORKGROUP_SIZE = 8;
 
-    // Phase 6 step 1. The probe buffer: every float the shader drew, at full
-    // precision, for the host checkpoint to compare against its own
-    // reference. Not a render target and not on the display path.
-    VkBuffer rngProbeBuffer;
-    VkDeviceMemory rngProbeMemory;
+    // Phase 6 step 1, widened in step 2. The probe buffer: what the shader
+    // produced, at full precision, for the host checkpoint to compare against
+    // its own reference. Not a render target and not on the display path.
+    //
+    // Step 1 held four raw draws per pixel. It now holds the finished ray --
+    // two vec4 entries, origin-and-time then direction -- because the ray is
+    // computed from those draws and so is strictly stronger evidence: a wrong
+    // draw cannot produce a right ray.
+    VkBuffer rayProbeBuffer;
+    VkDeviceMemory rayProbeMemory;
 
     // Mapped at creation and left mapped until cleanup. A persistent mapping
     // costs nothing on this hardware, and map/read/unmap around each
     // checkpoint would be three calls to achieve the same thing.
-    void* rngProbeMapped = nullptr;
+    void* rayProbeMapped = nullptr;
 
-    // MUST MATCH the number of nextFloat() calls in shader.comp -- the shader
-    // advances its state once per call, so a disagreement here shifts every
-    // value after the first. See trap 1 at the top of the file.
-    static const uint32_t RNG_DRAWS_PER_PIXEL = 4;
+    // MUST MATCH the probe writes in shader.comp. See trap 1 at the top.
+    static const uint32_t PROBE_VEC4S_PER_PIXEL = 2;
+
+    // MUST MATCH the number of nextFloat() calls getRay makes, which is 5 at
+    // this camera and 3 at a camera with no lens -- see trap 7. Step 1 set
+    // this to 4 with a note guessing at jitter plus a scatter direction; that
+    // guess was wrong in a way reading get_ray settled. The jitter is two,
+    // the defocus disk is two more and conditional, and the shutter time is a
+    // fifth that nothing reads yet.
+    static const uint32_t RAY_DRAWS_WITH_LENS = 5;
 
     // What the probe holds before any dispatch writes it, serving the same
     // purpose as STORAGE_SENTINEL above: it distinguishes "the shader never
     // wrote this" from "the shader wrote the wrong thing". Outside [0,1), so
     // it fails the range test too rather than only the comparison.
-    static constexpr float RNG_PROBE_SENTINEL = -1.0f;
+    static constexpr float RAY_PROBE_SENTINEL = -1.0f;
 
     // Buckets for the chi-square over [0,1). Sixteen leaves 120,000 values
     // expected in each, which is enough for the statistic to be tight.
     static const int RNG_BUCKETS = 16;
+
+    // Phase 6 step 2. The camera, and these six are the INPUTS the CPU's
+    // camera class takes. Copied from the first scene in src/main.cpp so that
+    // the end-of-phase comparison has a camera both backends can be given,
+    // with one deviation: the aspect ratio comes from the render target
+    // instead of the scene's 16/9, because RENDER_WIDTH and RENDER_HEIGHT are
+    // 800x600. Driving the CPU to the same 800x600 is a matter of setting
+    // aspect_ratio to 4/3 and image_width to 800, since it derives its height
+    // as int(image_width / aspect_ratio).
+    //
+    // doubles, matching the CPU exactly, and narrowed to float only when the
+    // uniform is filled. The arithmetic that produces the six vectors runs
+    // once per program, so there is nothing to gain by doing it in float and
+    // something to lose: the uniform would then hold the float-rounded
+    // results of float-rounded intermediates.
+    static constexpr double CAMERA_VFOV = 21.0;
+    static constexpr double CAMERA_DEFOCUS_ANGLE = 0.6;
+    static constexpr double CAMERA_FOCUS_DIST = 10.0;
+
+    VkBuffer cameraUniformBuffer;
+    VkDeviceMemory cameraUniformMemory;
+    void* cameraUniformMapped = nullptr;
+
+    // Kept after the upload, because the checkpoint needs them. These are the
+    // exact float values the shader reads, so the host reference starts from
+    // the same numbers rather than from the doubles they were rounded from --
+    // which isolates "did the shader do the arithmetic right" from "is
+    // narrowing to float lossy", two questions that would otherwise be mixed
+    // into one tolerance.
+    CameraUniform cameraValues{};
+
+    // The orthonormal basis, in double. NOT uploaded: the shader derives
+    // every ray from the six vectors above and never needs the basis itself.
+    // The checkpoint does need it -- the symmetry and squareness tests below
+    // are stated in terms of w -- so it stays on the host, where it is free.
+    glm::dvec3 cameraU{};
+    glm::dvec3 cameraV{};
+    glm::dvec3 cameraW{};
 
     // Semaphores order one GPU operation against another and never block the
     // CPU -- their state cannot even be read from the host. A fence is the
@@ -588,7 +677,13 @@ private:
         // Before the compute descriptor set, which points at it. Nothing else
         // depends on it: it is not on the display path and no pipeline is
         // built from it.
-        createRngProbeBuffer();
+        createRayProbeBuffer();
+
+        // Before the compute descriptor set, which points at it. Its
+        // arithmetic needs nothing from the device, so it could run anywhere;
+        // it goes here so that the printed camera sits next to the buffer it
+        // was written into.
+        createCameraUniformBuffer();
 
         createDescriptorPool();
         createDescriptorSets();
@@ -2197,9 +2292,9 @@ private:
 
     // Phase 6 step 1. The buffer the checkpoint reads, and the first SHADER
     // STORAGE BUFFER in this project.
-    void createRngProbeBuffer() {
+    void createRayProbeBuffer() {
         VkDeviceSize size = static_cast<VkDeviceSize>(RENDER_WIDTH) *
-                            RENDER_HEIGHT * RNG_DRAWS_PER_PIXEL *
+                            RENDER_HEIGHT * PROBE_VEC4S_PER_PIXEL * 4 *
                             sizeof(float);
 
         // HOST_VISIBLE and HOST_COHERENT, where every buffer the renderer
@@ -2220,11 +2315,11 @@ private:
         createBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     rngProbeBuffer, rngProbeMemory, "RNG probe buffer");
+                     rayProbeBuffer, rayProbeMemory, "Ray probe buffer");
 
-        if (vkMapMemory(device, rngProbeMemory, 0, size, 0, &rngProbeMapped) !=
+        if (vkMapMemory(device, rayProbeMemory, 0, size, 0, &rayProbeMapped) !=
             VK_SUCCESS) {
-            throw std::runtime_error("failed to map the RNG probe buffer!");
+            throw std::runtime_error("failed to map the ray probe buffer!");
         }
 
         // POISONED, for the same reason the storage image is cleared to a
@@ -2233,17 +2328,163 @@ private:
         // dispatch that silently did not run would look like a generator stuck
         // at zero rather than like a dispatch that did not run. -1.0 cannot be
         // produced by nextFloat and is reported separately from a mismatch.
-        float* poison = static_cast<float*>(rngProbeMapped);
+        float* poison = static_cast<float*>(rayProbeMapped);
         size_t count = static_cast<size_t>(size) / sizeof(float);
         for (size_t i = 0; i < count; i++) {
-            poison[i] = RNG_PROBE_SENTINEL;
+            poison[i] = RAY_PROBE_SENTINEL;
         }
 
-        std::cout << "RNG probe buffer: " << size << " B = "
+        std::cout << "Ray probe buffer: " << size << " B = "
                   << (static_cast<size_t>(RENDER_WIDTH) * RENDER_HEIGHT)
-                  << " pixels x " << RNG_DRAWS_PER_PIXEL
-                  << " floats, host-visible and mapped at " << rngProbeMapped
-                  << ", filled with the sentinel " << RNG_PROBE_SENTINEL
+                  << " pixels x " << PROBE_VEC4S_PER_PIXEL
+                  << " vec4, host-visible and mapped at " << rayProbeMapped
+                  << ", filled with the sentinel " << RAY_PROBE_SENTINEL
+                  << std::endl;
+    }
+
+    // Phase 6 step 2. camera::initialize() from camera.h, run once on the
+    // host, plus the uniform buffer its six results travel in.
+    //
+    // THE SPLIT IS THE INTERESTING PART. initialize() turns six scene
+    // parameters into six vectors; get_ray() uses only those vectors. So this
+    // runs once per program and the shader runs 480,000 times a frame, and
+    // nothing about the field of view or the basis is recomputed in between.
+    // Deciding where that line falls is most of what porting a renderer to a
+    // GPU is.
+    void createCameraUniformBuffer() {
+        // The CPU's inputs, from the first scene in src/main.cpp.
+        const glm::dvec3 lookfrom(13.0, 2.0, -3.0);
+        const glm::dvec3 lookat(0.0, 0.0, 0.0);
+        const glm::dvec3 vup(0.0, 1.0, 0.0);
+
+        // pi and degrees_to_radians from rtweekend.h, inline. glm::radians
+        // would do the same; written out so the lines below read as a
+        // transliteration of initialize() rather than as a reimplementation.
+        const double pi = 3.1415926535897932385;
+        double theta = CAMERA_VFOV * pi / 180.0;
+        double h = std::tan(theta / 2.0);
+        double viewportHeight = 2.0 * h * CAMERA_FOCUS_DIST;
+
+        // THE RATIO OF THE INTEGER DIMENSIONS, not the aspect_ratio
+        // parameter, and the CPU does the same thing for a reason worth
+        // keeping: it derives image_height as int(image_width / aspect_ratio),
+        // so after that truncation the stored ratio and the real one differ.
+        // Using the integers reproduces whatever the truncation did. Here they
+        // are 800 and 600 and the two agree, which is exactly when a
+        // substitution like this goes unnoticed.
+        double viewportWidth = viewportHeight *
+                               (static_cast<double>(RENDER_WIDTH) /
+                                static_cast<double>(RENDER_HEIGHT));
+
+        // THE BASIS. w points BACKWARD, from the target toward the eye, which
+        // is why the viewport is placed at -focus_dist * w below and why
+        // every ray direction has a dot product of exactly -focus_dist with
+        // it. u is right, v is up.
+        //
+        // v needs no normalisation: w and u are unit and perpendicular, so
+        // their cross product is already unit. The CPU does not normalise it
+        // either.
+        cameraW = glm::normalize(lookfrom - lookat);
+        cameraU = glm::normalize(glm::cross(vup, cameraW));
+        cameraV = glm::cross(cameraW, cameraU);
+
+        // viewportV is NEGATED. The viewport's vertical axis runs DOWN the
+        // image because pixel rows are numbered downward, while v points up.
+        // Dropping the minus renders the scene upside down and nothing
+        // reports it -- which is the same hazard the fullscreen triangle's v
+        // coordinate had in Phase 5, arriving a second time from the other
+        // direction.
+        glm::dvec3 viewportU = viewportWidth * cameraU;
+        glm::dvec3 viewportV = viewportHeight * -cameraV;
+
+        glm::dvec3 pixelDeltaU =
+            viewportU / static_cast<double>(RENDER_WIDTH);
+        glm::dvec3 pixelDeltaV =
+            viewportV / static_cast<double>(RENDER_HEIGHT);
+
+        glm::dvec3 viewportUpperLeft = lookfrom -
+                                       (CAMERA_FOCUS_DIST * cameraW) -
+                                       viewportU / 2.0 - viewportV / 2.0;
+
+        // Half a pixel in from the corner, so pixel00Loc is the CENTRE of
+        // pixel (0,0) rather than its corner. That half-pixel is what makes
+        // the jitter's [-0.5, +0.5] range cover exactly the pixel.
+        glm::dvec3 pixel00Loc =
+            viewportUpperLeft + 0.5 * (pixelDeltaU + pixelDeltaV);
+
+        // The lens radius. Note the HALF ANGLE: defocus_angle is the full
+        // cone subtended by the aperture seen from the focal plane, so the
+        // radius uses half of it. At 0.6 degrees this is 10 * tan(0.3 deg) =
+        // about 0.052 world units -- a small lens, which is why the blur is
+        // subtle at this camera and would be easy to get wrong unnoticed.
+        double defocusRadius =
+            CAMERA_FOCUS_DIST *
+            std::tan(CAMERA_DEFOCUS_ANGLE / 2.0 * pi / 180.0);
+
+        // NARROWED HERE AND NOWHERE ELSE. Everything above is double, as the
+        // CPU's is; the single conversion to float happens as the values go
+        // into the block the shader reads. Doing the arithmetic in float
+        // instead would round every intermediate, and the two backends would
+        // then differ by more than one rounding without anything saying which
+        // of the two was closer to right.
+        cameraValues.center = glm::vec3(lookfrom);
+        cameraValues.pixel00Loc = glm::vec3(pixel00Loc);
+        cameraValues.pixelDeltaU = glm::vec3(pixelDeltaU);
+        cameraValues.pixelDeltaV = glm::vec3(pixelDeltaV);
+        cameraValues.defocusDiskU = glm::vec3(cameraU * defocusRadius);
+        cameraValues.defocusDiskV = glm::vec3(cameraV * defocusRadius);
+        cameraValues.defocusAngle = static_cast<float>(CAMERA_DEFOCUS_ANGLE);
+
+        // ONE BUFFER, not one per frame in flight, and the rule is step 3's:
+        // group by update frequency. The camera does not move in this phase,
+        // so this is written once at startup and read by every frame
+        // thereafter -- there is nothing per-frame about it and nothing to
+        // synchronise. Phase 7's camera controls are precisely what will turn
+        // it into a per-frame buffer with a descriptor each, which is the
+        // arrangement step 6 deleted.
+        createBuffer(sizeof(CameraUniform),
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     cameraUniformBuffer, cameraUniformMemory,
+                     "Camera uniform buffer");
+
+        if (vkMapMemory(device, cameraUniformMemory, 0, sizeof(CameraUniform),
+                        0, &cameraUniformMapped) != VK_SUCCESS) {
+            throw std::runtime_error(
+                "failed to map the camera uniform buffer!");
+        }
+
+        memcpy(cameraUniformMapped, &cameraValues, sizeof(CameraUniform));
+
+        std::cout << "Camera uniform buffer: " << sizeof(CameraUniform)
+                  << " B, std140, host-visible and mapped at "
+                  << cameraUniformMapped
+                  << "\n\tvfov:          " << CAMERA_VFOV << " deg"
+                  << ", focus dist " << CAMERA_FOCUS_DIST
+                  << ", defocus angle " << CAMERA_DEFOCUS_ANGLE << " deg"
+                  << "\n\tlens radius:   " << defocusRadius
+                  << " world units"
+                  << "\n\tviewport:      " << viewportWidth << " x "
+                  << viewportHeight << " at " << CAMERA_FOCUS_DIST
+                  << " along -w"
+                  << "\n\tcenter:        " << cameraValues.center.x << ", "
+                  << cameraValues.center.y << ", " << cameraValues.center.z
+                  << "\n\tpixel00Loc:    " << cameraValues.pixel00Loc.x
+                  << ", " << cameraValues.pixel00Loc.y << ", "
+                  << cameraValues.pixel00Loc.z
+                  << "\n\tpixelDeltaU:   " << cameraValues.pixelDeltaU.x
+                  << ", " << cameraValues.pixelDeltaU.y << ", "
+                  << cameraValues.pixelDeltaU.z
+                  << "\n\tpixelDeltaV:   " << cameraValues.pixelDeltaV.x
+                  << ", " << cameraValues.pixelDeltaV.y << ", "
+                  << cameraValues.pixelDeltaV.z
+                  << "\n\tbasis u:       " << cameraU.x << ", " << cameraU.y
+                  << ", " << cameraU.z
+                  << "\n\tbasis v:       " << cameraV.x << ", " << cameraV.y
+                  << ", " << cameraV.z
+                  << "\n\tbasis w:       " << cameraW.x << ", " << cameraW.y
+                  << ", " << cameraW.z << "  (points eye-ward)"
                   << std::endl;
     }
 
@@ -2280,11 +2521,22 @@ private:
         probeBufferBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         probeBufferBinding.pImmutableSamplers = nullptr;
 
+        // Phase 6 step 2. UNIFORM_BUFFER, the type step 6 deleted, back for
+        // the camera. Read-only to the shader by its type -- which is the
+        // whole difference from the STORAGE_BUFFER above, and the reason this
+        // is the right type for a camera and the wrong one for the probe.
+        VkDescriptorSetLayoutBinding cameraBinding{};
+        cameraBinding.binding = 2;
+        cameraBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        cameraBinding.descriptorCount = 1;
+        cameraBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        cameraBinding.pImmutableSamplers = nullptr;
+
         // The binding NUMBERS are what the shader's layout(binding = N)
         // matches, not the order in this array. They happen to agree here;
         // relying on that would be a bug waiting for the day they do not.
-        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {
-            storageImageBinding, probeBufferBinding};
+        std::array<VkDescriptorSetLayoutBinding, 3> bindings = {
+            storageImageBinding, probeBufferBinding, cameraBinding};
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =
@@ -2303,6 +2555,7 @@ private:
                   << " bindings"
                   << "\n\tbinding 0: STORAGE_IMAGE x1, COMPUTE stage"
                   << "\n\tbinding 1: STORAGE_BUFFER x1, COMPUTE stage"
+                  << "\n\tbinding 2: UNIFORM_BUFFER x1, COMPUTE stage"
                   << "\n\tnamespace: separate from the graphics layout's"
                      " binding 0"
                   << std::endl;
@@ -2459,11 +2712,24 @@ private:
         // the bound range, so passing a short range here would silently
         // shorten draws[] rather than fail.
         VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = rngProbeBuffer;
+        bufferInfo.buffer = rayProbeBuffer;
         bufferInfo.offset = 0;
         bufferInfo.range = VK_WHOLE_SIZE;
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
+        // Phase 6 step 2. The camera's range is sizeof(CameraUniform), not
+        // VK_WHOLE_SIZE as the probe's is, and the difference is not
+        // stylistic: a uniform buffer's range is bounded by
+        // maxUniformBufferRange, which the spec guarantees only to 16 KB
+        // against 128 MB for a storage buffer. Naming the exact size is how
+        // that stays checkable. It is also why the scene data in Phase 8 has
+        // to be storage buffers -- 7.68 MB of probe would not fit in a
+        // uniform block at all.
+        VkDescriptorBufferInfo cameraInfo{};
+        cameraInfo.buffer = cameraUniformBuffer;
+        cameraInfo.offset = 0;
+        cameraInfo.range = sizeof(CameraUniform);
+
+        std::array<VkWriteDescriptorSet, 3> writes{};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = computeDescriptorSet;
@@ -2481,6 +2747,14 @@ private:
         writes[1].descriptorCount = 1;
         writes[1].pBufferInfo = &bufferInfo;
 
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = computeDescriptorSet;
+        writes[2].dstBinding = 2;
+        writes[2].dstArrayElement = 0;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[2].descriptorCount = 1;
+        writes[2].pBufferInfo = &cameraInfo;
+
         vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
 
@@ -2488,8 +2762,10 @@ private:
                   << "\n\tbinding 0 -> view " << storageImageView
                   << ", sampler none, layout "
                   << imageLayoutString(VK_IMAGE_LAYOUT_GENERAL)
-                  << "\n\tbinding 1 -> buffer " << rngProbeBuffer
+                  << "\n\tbinding 1 -> buffer " << rayProbeBuffer
                   << ", offset 0, range VK_WHOLE_SIZE"
+                  << "\n\tbinding 2 -> buffer " << cameraUniformBuffer
+                  << ", offset 0, range " << sizeof(CameraUniform)
                   << "\n\tsets:       1, not one per frame -- neither the"
                      " image nor the buffer it points at ever changes"
                   << std::endl;
@@ -2615,7 +2891,7 @@ private:
                   << (RENDER_WIDTH * RENDER_HEIGHT) << " texels, time "
                   << time << " s" << std::endl;
 
-        verifyRngProbe(time, "startup self-test");
+        verifyCameraRays(time, "startup self-test");
     }
 
     // THE HOST REFERENCE FOR THE SHADER'S GENERATOR, written out operator
@@ -2661,115 +2937,231 @@ private:
         return seed;
     }
 
-    // THE CHECKPOINT FOR THIS STEP, and it answers two separate questions.
+    // What getRay() should have produced, plus the draws it took on the way.
+    // The draws are returned because they ARE part of what the function did:
+    // the distribution tests below run on them, and the GPU inherits those
+    // results because the rays agreeing is what establishes that both sides
+    // drew the same numbers.
+    struct HostRay {
+        glm::vec3 origin;
+        glm::vec3 direction;
+        float time;
+        float draws[5];
+        int drawCount;
+    };
+
+    // getRay from shader.comp, transliterated back. See trap 1: one function
+    // written twice. Two details are load-bearing and both are about the
+    // random stream rather than the geometry.
     //
-    // FIDELITY, by exact comparison: all 1,920,000 floats against the host
-    // reference above, bit for bit. This is possible because the generator is
-    // exact throughout, and it is what catches a wrong constant, a wrong shift
-    // amount, a draw count that disagrees, a seed built from the wrong
-    // coordinates, a transposed index, a dispatch that missed part of the
-    // image, and a push constant that arrived as garbage.
+    // THE DRAWS ARE SEQUENCED INTO NAMED LOCALS, matching the shader, because
+    // neither GLSL nor C++ defines the evaluation order of an expression's
+    // operands. Written the compact way on both sides, the two compilers
+    // could disagree about which draw is the x jitter and nothing would say
+    // so -- the image would antialias correctly off a different stream.
     //
-    // QUALITY, by statistics: whether what the shader faithfully computed is
-    // actually uniform and uncorrelated. A perfectly faithful port of a bad
-    // generator passes the first test and fails these.
+    // IT STARTS FROM cameraValues, the float block the shader reads, not from
+    // the doubles those were narrowed from. Otherwise the comparison would be
+    // measuring the narrowing as well as the arithmetic, and a tolerance
+    // covering both could not tell them apart.
+    HostRay hostGetRay(int i, int j, uint32_t& state) const {
+        const float PI_F = 3.1415926535897932385f;
+
+        HostRay out{};
+        out.drawCount = 0;
+
+        float jitterX = hostNextFloat(state);
+        float jitterY = hostNextFloat(state);
+        out.draws[out.drawCount++] = jitterX;
+        out.draws[out.drawCount++] = jitterY;
+
+        glm::vec3 pixelSample =
+            cameraValues.pixel00Loc +
+            (static_cast<float>(i) + (jitterX - 0.5f)) *
+                cameraValues.pixelDeltaU +
+            (static_cast<float>(j) + (jitterY - 0.5f)) *
+                cameraValues.pixelDeltaV;
+
+        out.origin = cameraValues.center;
+
+        // The conditional pair. At a camera with no lens these two draws do
+        // not happen and the shutter time below is the third number rather
+        // than the fifth -- see trap 7.
+        if (cameraValues.defocusAngle > 0.0f) {
+            float diskR = hostNextFloat(state);
+            float diskTheta = hostNextFloat(state);
+            out.draws[out.drawCount++] = diskR;
+            out.draws[out.drawCount++] = diskTheta;
+
+            float r = std::sqrt(diskR);
+            float theta = 2.0f * PI_F * diskTheta;
+            out.origin = cameraValues.center +
+                         (r * std::cos(theta)) * cameraValues.defocusDiskU +
+                         (r * std::sin(theta)) * cameraValues.defocusDiskV;
+        }
+
+        float shutter = hostNextFloat(state);
+        out.draws[out.drawCount++] = shutter;
+        out.time = shutter;
+
+        // Unnormalised, as the CPU leaves it.
+        out.direction = pixelSample - out.origin;
+        return out;
+    }
+
+    // THE CHECKPOINT FOR THIS STEP. Four independent questions, and the
+    // reason there are four is that this step's arithmetic is no longer
+    // exact: step 1's generator was all integers and a power-of-two scale, so
+    // the host could predict every bit. A camera ray involves divisions, a
+    // square root and a sine, and the Vulkan specification allows a couple of
+    // units in the last place on those. Bit-exact comparison is therefore
+    // gone, and a tolerance alone would be a weak replacement -- so the
+    // tolerance is backed by invariants that hold exactly in geometry and
+    // cannot be satisfied by a ray field that is merely close.
     //
-    // Replaces verifyComputeGradient, which compared the same image against a
-    // gradient formula. The gradient is gone; the shape of the checkpoint --
-    // read everything back, recompute it on the host, compare exactly -- is
-    // the part worth keeping, and this is the same idea through a buffer
-    // instead of an image.
+    //   1. AGREEMENT. Every ray against hostGetRay, within a tolerance, which
+    //      catches wrong arithmetic, a wrong uniform offset, a transposed
+    //      index, and a draw order that disagrees with the host's.
     //
-    // What it still CANNOT catch is a missing barrier. See trap 5: on this
-    // hardware both barriers could be deleted and every number here would
-    // very likely still be right.
-    void verifyRngProbe(float time, const char* label) {
-        // THRESHOLDS, each a multiple of the actual sampling error rather than
-        // a round number. Over 1,920,000 values the standard error of the mean
-        // is sqrt((1/12)/n) = 2.1e-4, so 2e-3 is about nine sigma. The
-        // standard deviation of the sample variance is 5.4e-5, so 1e-3 is
-        // about eighteen. The 99.9th percentile of chi-square at 15 degrees of
-        // freedom is 37.7. The standard error of a correlation over 1,440,000
-        // pairs is 8.3e-4, so 0.01 is about twelve sigma.
+    //   2. PLANARITY, which is the strong one. Every ray direction must have
+    //      a dot product with w of exactly -focus_dist. That is true because
+    //      the viewport is a plane perpendicular to w at that distance, and
+    //      because the lens offset lies in the u-v plane, so moving the
+    //      origin across the lens does not change it. It is one number per
+    //      pixel and it pins the basis orthogonality, the focus distance and
+    //      the defocus disk's orientation all at once -- a camera that was
+    //      skewed, mis-scaled or had its disk built from the wrong vectors
+    //      fails it. No picture could show this.
+    //
+    //   3. SYMMETRY. Pixel-centre directions for mirrored pairs must sum to
+    //      exactly -2 * focus_dist * w, from the host's own uniform values.
+    //      This catches a flipped viewport axis, which planarity cannot: an
+    //      upside-down camera is still perfectly planar.
+    //
+    //   4. DISTRIBUTION. Step 1's tests, on the five draws each ray consumes,
+    //      so the generator stays gated now that the probe no longer carries
+    //      raw draws.
+    //
+    // What it still cannot catch is a missing barrier. See trap 5.
+    void verifyCameraRays(float time, const char* label) {
+        // Geometry tolerances are absolute and in world units, where the
+        // scene is about 13 across. A float holds ~7 significant digits, so a
+        // single rounding at this magnitude is near 1e-6; a handful of
+        // operations plus the fused multiply-adds a compiler may introduce
+        // puts the expected disagreement around 1e-5. 1e-3 is therefore about
+        // a hundredfold margin -- loose enough never to fail spuriously,
+        // tight enough that a real error cannot hide, since the smallest
+        // meaningful one here is a pixel's worth of direction at 6e-3.
         //
-        // Deliberately loose, because the failures these exist to catch are
-        // gross: a generator with marching outputs scores a correlation in the
-        // tenths, and a biased one scores chi-square in the thousands. A false
-        // failure would be worse than a missed subtle bias, and nothing subtle
-        // can get past the exact comparison anyway.
-        //
-        // The values are not quite independent: 5.5% of pixels share a seed,
-        // so some numbers appear twice. That inflates each statistic by
-        // roughly 5%, which these margins absorb.
+        // The observed maxima are printed, which is the part worth reading:
+        // a threshold tells you a run passed, a maximum tells you how close
+        // it came.
+        constexpr double RAY_TOLERANCE = 1e-3;
+        constexpr double PLANARITY_TOLERANCE = 1e-3;
+        constexpr double SYMMETRY_TOLERANCE = 1e-3;
+        constexpr double ORTHONORMAL_TOLERANCE = 1e-9;
         constexpr double MEAN_TOLERANCE = 2e-3;
         constexpr double VARIANCE_TOLERANCE = 1e-3;
         constexpr double CHI_SQUARE_LIMIT = 50.0;
         constexpr double SERIAL_LIMIT = 0.01;
 
-        // THE SAME TRUNCATION THE SHADER DOES, from the same float. int() in
-        // GLSL and (int) in C++ both truncate toward zero, and the product is
-        // computed from bit-identical inputs in single precision on both
-        // sides, so the two sample indices agree exactly rather than nearly.
         int sampleIndex = static_cast<int>(time * 60.0f);
 
         const size_t pixels =
             static_cast<size_t>(RENDER_WIDTH) * RENDER_HEIGHT;
-        const size_t values = pixels * RNG_DRAWS_PER_PIXEL;
-        const float* actual = static_cast<const float*>(rngProbeMapped);
+        const float* probe = static_cast<const float*>(rayProbeMapped);
 
-        size_t mismatches = 0;
+        // Promoted to double so the host's own checking arithmetic contributes
+        // nothing to the numbers being judged.
+        const glm::dvec3 w = cameraW;
+
+        double maxRayError = 0.0;
+        size_t worstRayPixel = 0;
+        double maxPlanarityError = 0.0;
+        size_t worstPlanarityPixel = 0;
         size_t sentinels = 0;
-        size_t firstMismatch = 0;
-        float firstActual = 0.0f;
-        float firstExpected = 0.0f;
 
+        size_t drawCount = 0;
         size_t outOfRange = 0;
-        float minValue = 2.0f;
-        float maxValue = -2.0f;
+        float minDraw = 2.0f;
+        float maxDraw = -2.0f;
         double sum = 0.0;
         double sumSquares = 0.0;
         double serialSum = 0.0;
+        size_t serialPairs = 0;
         std::array<size_t, RNG_BUCKETS> bucketCounts{};
+
+        size_t wrongDrawCount = 0;
 
         for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
             for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
                 uint32_t state = hostPixelSampleSeed(
                     static_cast<int>(x), static_cast<int>(y), sampleIndex);
+                HostRay expected = hostGetRay(static_cast<int>(x),
+                                              static_cast<int>(y), state);
+
+                if (expected.drawCount !=
+                    static_cast<int>(RAY_DRAWS_WITH_LENS)) {
+                    wrongDrawCount++;
+                }
+
                 size_t base = (static_cast<size_t>(y) * RENDER_WIDTH + x) *
-                              RNG_DRAWS_PER_PIXEL;
+                              PROBE_VEC4S_PER_PIXEL * 4;
 
-                for (uint32_t d = 0; d < RNG_DRAWS_PER_PIXEL; d++) {
-                    float expected = hostNextFloat(state);
-                    float got = actual[base + d];
+                glm::dvec3 gotOrigin(probe[base + 0], probe[base + 1],
+                                     probe[base + 2]);
+                double gotTime = probe[base + 3];
+                glm::dvec3 gotDirection(probe[base + 4], probe[base + 5],
+                                        probe[base + 6]);
 
-                    // EXACT float comparison, which is almost always a
-                    // mistake and is the point here: there is no rounding
-                    // anywhere in either implementation, so anything other
-                    // than equality is a real disagreement. A NaN compares
-                    // unequal to itself and is counted, which is correct.
-                    if (got != expected) {
-                        if (mismatches == 0) {
-                            firstMismatch = base + d;
-                            firstActual = got;
-                            firstExpected = expected;
-                        }
-                        mismatches++;
-                    }
+                // 1. AGREEMENT, as the largest single component error across
+                // the origin, the direction and the shutter time.
+                double error = 0.0;
+                for (int c = 0; c < 3; c++) {
+                    error = std::max(
+                        error, std::abs(gotOrigin[c] -
+                                        static_cast<double>(
+                                            expected.origin[c])));
+                    error = std::max(
+                        error, std::abs(gotDirection[c] -
+                                        static_cast<double>(
+                                            expected.direction[c])));
+                }
+                error = std::max(
+                    error,
+                    std::abs(gotTime - static_cast<double>(expected.time)));
 
-                    // Counted separately, because "never written" and "wrong
-                    // value" are different diagnoses.
-                    if (got == RNG_PROBE_SENTINEL) {
-                        sentinels++;
-                    }
+                if (error > maxRayError) {
+                    maxRayError = error;
+                    worstRayPixel =
+                        static_cast<size_t>(y) * RENDER_WIDTH + x;
+                }
 
-                    // Everything below judges the SHADER'S value, not the
-                    // host's. Fidelity is settled above; these answer whether
-                    // the thing both sides agree on is any good.
+                // 2. PLANARITY, on the GPU's own direction.
+                double planarity =
+                    std::abs(glm::dot(gotDirection, w) + CAMERA_FOCUS_DIST);
+                if (planarity > maxPlanarityError) {
+                    maxPlanarityError = planarity;
+                    worstPlanarityPixel =
+                        static_cast<size_t>(y) * RENDER_WIDTH + x;
+                }
+
+                if (probe[base + 0] == RAY_PROBE_SENTINEL &&
+                    probe[base + 1] == RAY_PROBE_SENTINEL &&
+                    probe[base + 2] == RAY_PROBE_SENTINEL) {
+                    sentinels++;
+                }
+
+                // 4. DISTRIBUTION, on the draws this ray consumed.
+                for (int d = 0; d < expected.drawCount; d++) {
+                    float got = expected.draws[d];
+                    drawCount++;
+
                     if (!(got >= 0.0f && got < 1.0f)) {
                         outOfRange++;
                     }
-                    minValue = std::min(minValue, got);
-                    maxValue = std::max(maxValue, got);
+                    minDraw = std::min(minDraw, got);
+                    maxDraw = std::max(maxDraw, got);
                     sum += got;
                     sumSquares += static_cast<double>(got) * got;
 
@@ -2777,25 +3169,21 @@ private:
                     bucket = std::max(0, std::min(RNG_BUCKETS - 1, bucket));
                     bucketCounts[static_cast<size_t>(bucket)]++;
 
-                    // Consecutive draws WITHIN one pixel's stream, which is
-                    // the axis that matters: a hash whose successive outputs
-                    // march would still have a flat histogram and a mean of
-                    // 0.5. This is the test that the one-line hashes a path
-                    // tracer is often written with fail.
                     if (d > 0) {
                         serialSum +=
-                            static_cast<double>(actual[base + d - 1]) * got;
+                            static_cast<double>(expected.draws[d - 1]) * got;
+                        serialPairs++;
                     }
                 }
             }
         }
 
-        double mean = sum / static_cast<double>(values);
+        double mean = sum / static_cast<double>(drawCount);
         double variance =
-            sumSquares / static_cast<double>(values) - mean * mean;
+            sumSquares / static_cast<double>(drawCount) - mean * mean;
 
         double expectedPerBucket =
-            static_cast<double>(values) / RNG_BUCKETS;
+            static_cast<double>(drawCount) / RNG_BUCKETS;
         double chiSquare = 0.0;
         for (size_t b = 0; b < RNG_BUCKETS; b++) {
             double deviation =
@@ -2803,41 +3191,54 @@ private:
             chiSquare += deviation * deviation / expectedPerBucket;
         }
 
-        // Pearson correlation, using the known marginals rather than the
-        // sample ones: for independent draws from U(0,1), E[xy] is 0.25 and
-        // each variance is 1/12, so r = (E[xy] - 0.25) * 12.
-        size_t serialPairs = pixels * (RNG_DRAWS_PER_PIXEL - 1);
         double serialR =
             (serialSum / static_cast<double>(serialPairs) - 0.25) * 12.0;
 
-        // THE INHERITED FLAW, measured rather than remembered. A property of
-        // the shared seeding scheme and not of this port -- see the file
-        // header. Printed every run so that a change to rng.h upstream shows
-        // up here as a changed number instead of going unnoticed.
-        std::vector<uint32_t> seeds;
-        seeds.reserve(pixels);
-        for (uint32_t y = 0; y < RENDER_HEIGHT; y++) {
-            for (uint32_t x = 0; x < RENDER_WIDTH; x++) {
-                seeds.push_back(hostPixelSampleSeed(
-                    static_cast<int>(x), static_cast<int>(y), sampleIndex));
+        // 3. SYMMETRY, host-side from the uniform. The pixel-CENTRE direction,
+        // with no jitter and no lens offset, which is the deterministic part
+        // of the camera and the only part a symmetry statement can be made
+        // about.
+        auto centreDirection = [this](uint32_t i, uint32_t j) {
+            glm::dvec3 p(cameraValues.pixel00Loc);
+            p += static_cast<double>(i) * glm::dvec3(cameraValues.pixelDeltaU);
+            p += static_cast<double>(j) * glm::dvec3(cameraValues.pixelDeltaV);
+            return p - glm::dvec3(cameraValues.center);
+        };
+
+        glm::dvec3 expectedSum = -2.0 * CAMERA_FOCUS_DIST * w;
+        double maxSymmetryError = 0.0;
+        const uint32_t symmetryProbes[5][2] = {
+            {0, 0},
+            {RENDER_WIDTH - 1, 0},
+            {0, RENDER_HEIGHT - 1},
+            {RENDER_WIDTH / 3, RENDER_HEIGHT / 7},
+            {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
+        for (const auto& sp : symmetryProbes) {
+            glm::dvec3 pairSum =
+                centreDirection(sp[0], sp[1]) +
+                centreDirection(RENDER_WIDTH - 1 - sp[0],
+                                RENDER_HEIGHT - 1 - sp[1]);
+            for (int c = 0; c < 3; c++) {
+                maxSymmetryError = std::max(
+                    maxSymmetryError, std::abs(pairSum[c] - expectedSum[c]));
             }
         }
-        std::sort(seeds.begin(), seeds.end());
-        size_t distinctSeeds = static_cast<size_t>(
-            std::unique(seeds.begin(), seeds.end()) - seeds.begin());
 
-        // THE IMAGE, checked against the PROBE rather than against the host
-        // reference. Deliberate: the generator has already been verified
-        // exactly, so comparing the image to the host again would test it
-        // twice and the image path not at all. Against the probe this answers
-        // the one question left -- did the three channels on screen come from
-        // these same three draws, this frame -- which catches a swapped
-        // channel, a stale image and a dispatch whose two outputs disagree.
-        //
-        // WITHIN 1, not exact, and this is the limit the buffer exists to
-        // escape. The float-to-UNORM conversion is specified to round
-        // correctly but its tie rule is implementation-chosen, so a value
-        // landing exactly between two bytes may legitimately go either way.
+        // The basis, in the double it was built in. Not a port check -- the
+        // basis never leaves the host -- but if it is not orthonormal then
+        // every test above is measuring against the wrong frame, so it is
+        // worth one line of certainty before trusting the other three.
+        double orthoError = 0.0;
+        orthoError = std::max(orthoError, std::abs(glm::length(cameraU) - 1.0));
+        orthoError = std::max(orthoError, std::abs(glm::length(cameraV) - 1.0));
+        orthoError = std::max(orthoError, std::abs(glm::length(cameraW) - 1.0));
+        orthoError = std::max(orthoError, std::abs(glm::dot(cameraU, cameraV)));
+        orthoError = std::max(orthoError, std::abs(glm::dot(cameraU, cameraW)));
+        orthoError = std::max(orthoError, std::abs(glm::dot(cameraV, cameraW)));
+
+        // THE IMAGE, against the probe's direction rather than the host's, so
+        // this tests the display path alone. Within 1, because the
+        // float-to-UNORM tie rule is implementation-chosen.
         std::vector<uint8_t> image = readbackImage(
             storageImage, RENDER_WIDTH, RENDER_HEIGHT,
             VK_IMAGE_LAYOUT_GENERAL);
@@ -2845,51 +3246,49 @@ private:
         size_t imageOff = 0;
         size_t alphaOff = 0;
         for (size_t pixel = 0; pixel < pixels; pixel++) {
-            for (size_t c = 0; c < 3; c++) {
-                float v = actual[pixel * RNG_DRAWS_PER_PIXEL + c];
-                int want = static_cast<int>(std::lround(v * 255.0f));
-                int got = image[pixel * 4 + c];
+            size_t base = pixel * PROBE_VEC4S_PER_PIXEL * 4;
+            glm::vec3 direction(probe[base + 4], probe[base + 5],
+                                probe[base + 6]);
+            glm::vec3 shown = glm::normalize(direction) * 0.5f + 0.5f;
+
+            for (int c = 0; c < 3; c++) {
+                int want =
+                    static_cast<int>(std::lround(shown[c] * 255.0f));
+                int got = image[pixel * 4 + static_cast<size_t>(c)];
                 if (got - want > 1 || want - got > 1) {
                     imageOff++;
                 }
             }
-
-            // The shader stores a constant 1.0 here, not the fourth draw, so
-            // this is exact and a failure means the alpha channel is not
-            // coming from where it is supposed to.
             if (image[pixel * 4 + 3] != 255) {
                 alphaOff++;
             }
         }
 
-        std::cout << "RNG probe verified (" << label << "): " << values
-                  << " floats read back at time " << time
-                  << " s, sample index " << sampleIndex << std::endl;
+        std::cout << "Camera rays verified (" << label << "): " << pixels
+                  << " rays read back at time " << time << " s, sample index "
+                  << sampleIndex << std::endl;
 
-        // THE STREAM'S FORMAT, saved and set rather than assumed. Both the
-        // flags and the precision, because reportFrameTiming leaves std::cout
-        // in std::fixed with a precision of 2 and never puts it back, and
-        // std::fixed is a STICKY flag. Without this the startup call prints
-        // 0.659163 and the post-loop call prints 0.85 -- the same value with
-        // most of its digits gone, which for numbers that exist to be
-        // eyeballed is the difference between a diagnostic and a decoration.
-        // The asserted comparisons below are numeric and were never affected;
-        // only what a reader can see was.
-        //
-        // NINE SIGNIFICANT DIGITS, which is what defaultfloat counts, not the
-        // nine decimal places std::fixed would have counted. A float carries
-        // about 7.2 significant digits, so nine shows every digit that is
-        // real and leaves a difference in the last place visible instead of
-        // rounded away.
         std::ios_base::fmtflags oldFlags = std::cout.flags();
         std::streamsize oldPrecision = std::cout.precision(9);
         std::cout << std::defaultfloat;
 
-        std::cout << "\tfidelity:    " << mismatches
-                  << " of " << values
-                  << " differ from the host reference, " << sentinels
+        std::cout << "\tagreement:   max component error " << maxRayError
+                  << " at pixel " << worstRayPixel << "  (limit "
+                  << RAY_TOLERANCE << ")"
+                  << "\n\tplanarity:   max |dot(dir,w) + focus_dist| "
+                  << maxPlanarityError << " at pixel " << worstPlanarityPixel
+                  << "  (limit " << PLANARITY_TOLERANCE << ")"
+                  << "\n\tsymmetry:    max mirrored-pair error "
+                  << maxSymmetryError << " over "
+                  << (sizeof(symmetryProbes) / sizeof(symmetryProbes[0]))
+                  << " pairs  (limit " << SYMMETRY_TOLERANCE << ")"
+                  << "\n\tbasis:       max orthonormality error "
+                  << orthoError << "  (limit " << ORTHONORMAL_TOLERANCE << ")"
+                  << "\n\tstream:      " << drawCount << " draws, "
+                  << (drawCount / pixels) << " per ray, " << wrongDrawCount
+                  << " rays took the wrong count, " << sentinels
                   << " still hold the sentinel"
-                  << "\n\trange:       [" << minValue << ", " << maxValue
+                  << "\n\trange:       [" << minDraw << ", " << maxDraw
                   << "], " << outOfRange << " outside [0,1)"
                   << "\n\tmean:        " << mean << "  (0.5 +/- "
                   << MEAN_TOLERANCE << ")"
@@ -2902,45 +3301,52 @@ private:
                   << SERIAL_LIMIT << ")"
                   << "\n\timage:       " << imageOff << " of " << (pixels * 3)
                   << " RGB bytes differ from the probe by more than 1, "
-                  << alphaOff << " alpha bytes not 255"
-                  << "\n\tseeds:       " << distinctSeeds << " distinct of "
-                  << pixels << " pixels, " << (pixels - distinctSeeds)
-                  << " collisions -- inherited from rng.h, not a port defect"
-                  << std::endl;
+                  << alphaOff << " alpha bytes not 255" << std::endl;
 
-        // Four probe pixels, printed so the numbers are inspectable rather
-        // than only asserted. The two off-diagonal corners differ and
-        // 800 != 600, so a transposed mapping cannot pass unnoticed.
-        const uint32_t probes[4][2] = {{0, 0},
-                                       {RENDER_WIDTH - 1, 0},
-                                       {0, RENDER_HEIGHT - 1},
-                                       {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
-        for (const auto& pr : probes) {
-            size_t base = (static_cast<size_t>(pr[1]) * RENDER_WIDTH + pr[0]) *
-                          RNG_DRAWS_PER_PIXEL;
-            std::cout << "\tpixel (" << pr[0] << "," << pr[1] << "): seed "
-                      << hostPixelSampleSeed(static_cast<int>(pr[0]),
-                                             static_cast<int>(pr[1]),
-                                             sampleIndex)
-                      << " -> " << actual[base + 0] << ", "
-                      << actual[base + 1] << ", " << actual[base + 2] << ", "
-                      << actual[base + 3] << std::endl;
+        const uint32_t probePixels[4][2] = {
+            {0, 0},
+            {RENDER_WIDTH - 1, 0},
+            {0, RENDER_HEIGHT - 1},
+            {RENDER_WIDTH / 2, RENDER_HEIGHT / 2}};
+        for (const auto& pp : probePixels) {
+            size_t base = (static_cast<size_t>(pp[1]) * RENDER_WIDTH + pp[0]) *
+                          PROBE_VEC4S_PER_PIXEL * 4;
+            std::cout << "\tpixel (" << pp[0] << "," << pp[1] << "): origin "
+                      << probe[base + 0] << ", " << probe[base + 1] << ", "
+                      << probe[base + 2] << "  dir " << probe[base + 4]
+                      << ", " << probe[base + 5] << ", " << probe[base + 6]
+                      << "  t " << probe[base + 3] << std::endl;
         }
 
-        // Restored AFTER the probe pixels, which is where the first version of
-        // this put it wrong: the four values most worth reading printed at
-        // whatever precision the caller happened to leave behind.
         std::cout.flags(oldFlags);
         std::cout.precision(oldPrecision);
 
-        if (mismatches != 0) {
+        if (maxRayError > RAY_TOLERANCE) {
             throw std::runtime_error(
-                "RNG probe does not match the host reference: " +
-                std::to_string(mismatches) + " of " + std::to_string(values) +
-                " floats differ (first at index " +
-                std::to_string(firstMismatch) + ", got " +
-                std::to_string(firstActual) + ", expected " +
-                std::to_string(firstExpected) + ")");
+                "camera rays disagree with the host reference: max component "
+                "error " + std::to_string(maxRayError) + " at pixel " +
+                std::to_string(worstRayPixel));
+        }
+        if (maxPlanarityError > PLANARITY_TOLERANCE) {
+            throw std::runtime_error(
+                "ray directions are not planar at focus_dist: max error " +
+                std::to_string(maxPlanarityError) + " at pixel " +
+                std::to_string(worstPlanarityPixel));
+        }
+        if (maxSymmetryError > SYMMETRY_TOLERANCE) {
+            throw std::runtime_error(
+                "mirrored pixel pairs are not symmetric about w: max error " +
+                std::to_string(maxSymmetryError));
+        }
+        if (orthoError > ORTHONORMAL_TOLERANCE) {
+            throw std::runtime_error(
+                "the camera basis is not orthonormal: max error " +
+                std::to_string(orthoError));
+        }
+        if (wrongDrawCount != 0) {
+            throw std::runtime_error(
+                std::to_string(wrongDrawCount) +
+                " ray(s) consumed the wrong number of draws");
         }
         if (outOfRange != 0) {
             throw std::runtime_error(
@@ -2961,8 +3367,7 @@ private:
         if (chiSquare > CHI_SQUARE_LIMIT) {
             throw std::runtime_error(
                 "RNG histogram is not flat: chi-square " +
-                std::to_string(chiSquare) + " over " +
-                std::to_string(RNG_BUCKETS) + " buckets");
+                std::to_string(chiSquare));
         }
         if (serialR < -SERIAL_LIMIT || serialR > SERIAL_LIMIT) {
             throw std::runtime_error(
@@ -2971,7 +3376,7 @@ private:
         }
         if (imageOff != 0 || alphaOff != 0) {
             throw std::runtime_error(
-                "the storage image does not hold the probe's values: " +
+                "the storage image does not hold the probe's directions: " +
                 std::to_string(imageOff) + " RGB byte(s) off by more than 1, " +
                 std::to_string(alphaOff) + " alpha byte(s) not 255");
         }
@@ -3029,7 +3434,7 @@ private:
         // per-frame uniform descriptors went with the per-frame buffers, and
         // the per-frame sets went with them, since pointing two identical
         // descriptors at one unchanging image is not a use of anything.
-        std::array<VkDescriptorPoolSize, 3> poolSizes{};
+        std::array<VkDescriptorPoolSize, 4> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -3042,6 +3447,14 @@ private:
         // descriptor, no more sets.
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[2].descriptorCount = 1;
+
+        // Phase 6 step 2. A FOURTH TYPE, still two sets: the camera
+        // descriptor joins the same compute set. One, not MAX_FRAMES_IN_FLIGHT
+        // of them, because the camera never changes in this phase -- which is
+        // the opposite answer to the one step 3 reached for its uniform
+        // buffer, from the same rule.
+        poolSizes[3].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[3].descriptorCount = 1;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -3069,8 +3482,9 @@ private:
                   << poolSizes[0].descriptorCount
                   << " COMBINED_IMAGE_SAMPLER + "
                   << poolSizes[1].descriptorCount << " STORAGE_IMAGE + "
-                  << poolSizes[2].descriptorCount
-                  << " STORAGE_BUFFER descriptors"
+                  << poolSizes[2].descriptorCount << " STORAGE_BUFFER + "
+                  << poolSizes[3].descriptorCount
+                  << " UNIFORM_BUFFER descriptors"
                   << "\n\tbudgets:   per type, and independent of maxSets"
                   << "\n\tgrowth:    none -- a pool is fixed at creation"
                   << "\n\tfreeing:   sets are released with the pool, not"
@@ -4011,10 +4425,16 @@ private:
         // memory is exactly the class of thing the validation layers are on
         // for, and a pointer that cannot be dereferenced is better than one
         // that can be dereferenced into nothing.
-        vkUnmapMemory(device, rngProbeMemory);
-        rngProbeMapped = nullptr;
-        vkDestroyBuffer(device, rngProbeBuffer, nullptr);
-        vkFreeMemory(device, rngProbeMemory, nullptr);
+        vkUnmapMemory(device, rayProbeMemory);
+        rayProbeMapped = nullptr;
+        vkDestroyBuffer(device, rayProbeBuffer, nullptr);
+        vkFreeMemory(device, rayProbeMemory, nullptr);
+
+        // The camera uniform buffer, by the same reasoning.
+        vkUnmapMemory(device, cameraUniformMemory);
+        cameraUniformMapped = nullptr;
+        vkDestroyBuffer(device, cameraUniformBuffer, nullptr);
+        vkFreeMemory(device, cameraUniformMemory, nullptr);
 
         vkDestroyImageView(device, storageImageView, nullptr);
         vkDestroyImage(device, storageImage, nullptr);
